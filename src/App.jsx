@@ -1,21 +1,17 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import {
   Flame, Package, Play, CheckCircle2, Truck, AlertTriangle, Plus, X,
   Trash2, Download, Users, LayoutDashboard, ClipboardList, ShieldCheck, LogIn,
 } from "lucide-react";
+import { createConfiguredDataService } from "./data/service.js";
 
 /* ------------------------------------------------------------------ */
 /*  AETE — Hot-Dip Galvanizing Tracker                                 */
 /*  Four gates: Received -> Processing -> Ready -> Dispatched          */
-/*  Data saves in this browser's local storage.                        */
+/*  Persistence is handled by the configured data service.            */
 /* ------------------------------------------------------------------ */
 
-const K = {
-  batches: "hdg_batches_v4",
-  roster: "hdg_roster_v4",
-  activity: "hdg_activity_v4",
-  settings: "hdg_settings_v4",
-};
+const dataService = createConfiguredDataService();
 
 const shiftLabel = (role) =>
   role === "shiftA" ? "Shift A"
@@ -29,22 +25,6 @@ function canActOn(role, status) {
     return role === "shiftA" || role === "shiftB"; // shift supervisors process
   if (status === "Ready") return role === "plant"; // plant supervisor dispatches
   return false;
-}
-
-async function sGet(key) {
-  try {
-    const value = window.localStorage.getItem(key);
-    return value ? JSON.parse(value) : null;
-  } catch {
-    return null;
-  }
-}
-function sSet(key, val) {
-  try {
-    window.localStorage.setItem(key, JSON.stringify(val));
-  } catch (e) {
-    console.error("save failed", e);
-  }
 }
 
 const uid = () =>
@@ -149,6 +129,10 @@ function makeSeed() {
 
 export default function App() {
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
+  const [dataNotice, setDataNotice] = useState("");
+  const [saveError, setSaveError] = useState("");
+  const [saving, setSaving] = useState(false);
   const [session, setSession] = useState(null); // null | { role: 'shiftA' | 'shiftB' | 'manager' }
   const [tab, setTab] = useState("batches");
 
@@ -156,6 +140,8 @@ export default function App() {
   const [roster, setRoster] = useState([]);
   const [activity, setActivity] = useState([]);
   const [settings, setSettings] = useState({ pin: "1234" });
+  const initialLoad = useRef(null);
+  const saveInProgress = useRef(false);
 
   const [filter, setFilter] = useState("All");
   const [action, setAction] = useState(null); // { batch }
@@ -163,40 +149,67 @@ export default function App() {
 
   useEffect(() => {
     let alive = true;
-    (async () => {
-      const r = await sGet(K.roster);
-      if (!r) {
-        const s = makeSeed();
-        sSet(K.roster, s.roster); sSet(K.batches, s.batches);
-        sSet(K.activity, s.activity); sSet(K.settings, s.settings);
-        if (alive) {
-          setRoster(s.roster); setBatches(s.batches);
-          setActivity(s.activity); setSettings(s.settings);
-        }
-      } else {
-        const b = (await sGet(K.batches)) || [];
-        const a = (await sGet(K.activity)) || [];
-        const st = (await sGet(K.settings)) || { pin: "1234" };
-        if (alive) { setRoster(r); setBatches(b); setActivity(a); setSettings(st); }
+    if (!initialLoad.current) {
+      initialLoad.current = (async () => {
+        const data = await dataService.load();
+        if (data.roster.length) return data;
+        const seed = makeSeed();
+        await dataService.seed(seed);
+        return seed;
+      })();
+    }
+    initialLoad.current.then((data) => {
+      if (!alive) return;
+      setRoster(data.roster); setBatches(data.batches);
+      setActivity(data.activity); setSettings(data.settings);
+      if (dataService.status.fallbackUsed) {
+        setDataNotice("Firebase emulator unavailable — using localStorage on this device.");
       }
-      if (alive) setLoading(false);
-    })();
+      setLoading(false);
+    }).catch((error) => {
+      console.error("Tracker data load failed", error);
+      if (alive) { setLoadError(true); setLoading(false); }
+    });
     return () => { alive = false; };
   }, []);
 
   const activeStaff = roster.filter((s) => s.active);
 
-  function logActivity(jobNo, actionLabel, who, shift) {
+  async function logActivity(jobNo, actionLabel, who, shift) {
     const entry = { id: uid(), at: nowISO(), jobNo, action: actionLabel, who, shift: shift || null };
-    setActivity((prev) => {
-      const next = [entry, ...prev].slice(0, 120);
-      sSet(K.activity, next);
-      return next;
-    });
+    try {
+      await dataService.addActivity(entry);
+      setActivity((prev) => [entry, ...prev].slice(0, 120));
+    } catch (error) {
+      console.error("Activity save failed", error);
+      setSaveError("The change was saved, but its activity entry was not. Please check the activity log.");
+    }
   }
-  function saveBatches(next) { setBatches(next); sSet(K.batches, next); }
 
-  function addBatch(form) {
+  async function saveChange(label, operation, commit, after) {
+    if (saveInProgress.current) return false;
+    saveInProgress.current = true;
+    setSaving(true);
+    setSaveError("");
+    try {
+      await operation();
+      commit();
+      if (dataService.status.fallbackUsed) {
+        setDataNotice("Firebase emulator unavailable — using localStorage on this device.");
+      }
+      if (after) await after();
+      return true;
+    } catch (error) {
+      console.error(`${label} failed`, error);
+      setSaveError(`${label} could not be saved. Please try again.`);
+      return false;
+    } finally {
+      saveInProgress.current = false;
+      setSaving(false);
+    }
+  }
+
+  async function addBatch(form) {
     if (session?.role !== "plant") return;
     const shift = session ? shiftLabel(session.role) : null;
     const b = {
@@ -205,12 +218,13 @@ export default function App() {
       weightIn: Number(form.weightIn) || 0, status: "Received",
       receivedBy: form.receivedBy, receivedAt: nowISO(), receivedShift: shift, notes: "",
     };
-    saveBatches([b, ...batches]);
-    logActivity(b.jobNo, "Received", b.receivedBy, shift);
-    setShowAdd(false);
+    return saveChange("Batch", () => dataService.addBatch(b), () => {
+      setBatches((prev) => [b, ...prev]);
+      setShowAdd(false);
+    }, () => logActivity(b.jobNo, "Received", b.receivedBy, shift));
   }
 
-  function applyAction(batch, who, extra) {
+  async function applyAction(batch, who, extra) {
     const step = NEXT[batch.status];
     if (!step || !canActOn(session?.role, batch.status)) return;
     const shift = session ? shiftLabel(session.role) : null;
@@ -222,33 +236,46 @@ export default function App() {
       patch.weightOut = Number(extra.weightOut) || 0;
     }
     if (batch.status === "Ready") { patch.dispatchBy = who; patch.dispatchAt = nowISO(); patch.dispatchShift = shift; }
-    saveBatches(batches.map((b) => (b.id === batch.id ? { ...b, ...patch } : b)));
-    logActivity(batch.jobNo,
+    return saveChange("Status update", () => dataService.updateBatch(batch.id, patch), () => {
+      setBatches((prev) => prev.map((b) => b.id === batch.id ? { ...b, ...patch } : b));
+      setAction(null);
+    }, () => logActivity(batch.jobNo,
       batch.status === "Received" ? "Into process" : batch.status === "Processing" ? "Ready" : "Dispatched",
-      who, shift);
-    setAction(null);
+      who, shift));
   }
 
-  function removeBatch(id) {
+  async function removeBatch(id) {
     if (!window.confirm("Delete this batch? This cannot be undone.")) return;
-    saveBatches(batches.filter((b) => b.id !== id));
+    return saveChange("Batch deletion", () => dataService.deleteBatch(id), () => {
+      setBatches((prev) => prev.filter((b) => b.id !== id));
+    });
   }
 
   /* roster ops */
-  function saveRoster(next) { setRoster(next); sSet(K.roster, next); }
   function addStaff(name, r, shift) {
     if (!name.trim()) return;
-    saveRoster([...roster, { id: uid(), name: name.trim(), role: r, shift: shift || null, active: true }]);
+    const staff = { id: uid(), name: name.trim(), role: r, shift: shift || null, active: true };
+    return saveChange("Staff member", () => dataService.addStaff(staff), () => {
+      setRoster((prev) => [...prev, staff]);
+    });
   }
   function toggleStaff(id) {
-    saveRoster(roster.map((s) => (s.id === id ? { ...s, active: !s.active } : s)));
+    const staff = roster.find((s) => s.id === id);
+    const patch = { active: !staff.active };
+    return saveChange("Roster update", () => dataService.updateStaff(id, patch), () => {
+      setRoster((prev) => prev.map((s) => s.id === id ? { ...s, ...patch } : s));
+    });
   }
   function removeStaff(id) {
     if (!window.confirm("Remove this staff member from the roster?")) return;
-    saveRoster(roster.filter((s) => s.id !== id));
+    return saveChange("Staff removal", () => dataService.deleteStaff(id), () => {
+      setRoster((prev) => prev.filter((s) => s.id !== id));
+    });
   }
   function changePin(p) {
-    const next = { ...settings, pin: p }; setSettings(next); sSet(K.settings, next);
+    return saveChange("Manager PIN", () => dataService.updateSettings({ pin: p }), () => {
+      setSettings((prev) => ({ ...prev, pin: p }));
+    });
   }
 
   function exportCSV() {
@@ -284,8 +311,16 @@ export default function App() {
       </div>
     );
 
+  if (loadError)
+    return (
+      <div className="min-h-screen flex flex-col gap-3 items-center justify-center bg-stone-100 text-stone-700">
+        <p>Tracker data could not be loaded. Check browser storage and try again.</p>
+        <button className="px-3 py-2 rounded-md bg-stone-900 text-white" onClick={() => window.location.reload()}>Retry</button>
+      </div>
+    );
+
   if (!session)
-    return <RolePicker correctPin={settings.pin} onPick={setSession} />;
+    return <RolePicker correctPin={settings.pin} storageKind={dataService.status.kind} onPick={setSession} />;
 
   const counts = ORDER.reduce((m, s) => ((m[s] = batches.filter((b) => b.status === s).length), m), {});
   const flagged = batches.filter((b) => flagsFor(b).length);
@@ -325,6 +360,7 @@ export default function App() {
           </div>
           <button
             onClick={() => { setSession(null); setTab("batches"); }}
+            disabled={saving}
             className="flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md border border-stone-700 hover:bg-stone-800"
           >
             {isMgr ? <ShieldCheck size={15} className="text-amber-400" /> : <LogIn size={15} />}
@@ -351,6 +387,16 @@ export default function App() {
       </header>
 
       <main className="max-w-2xl mx-auto px-4 py-4 pb-28">
+        {dataNotice && (
+          <div className="mb-3 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+            {dataNotice}
+          </div>
+        )}
+        {saveError && (
+          <div role="alert" className="mb-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
+            {saveError}
+          </div>
+        )}
         {/* ---------------- BATCHES ---------------- */}
         {tab === "batches" && (
           <>
@@ -377,7 +423,7 @@ export default function App() {
             ) : (
               <div className="space-y-2.5">
                 {sortedShown.map((b) => (
-                  <BatchRow key={b.id} b={b} role={session.role} onAct={() => setAction({ batch: b })}
+                  <BatchRow key={b.id} b={b} role={session.role} saving={saving} onAct={() => setAction({ batch: b })}
                     canDelete={isMgr} onDelete={() => removeBatch(b.id)} />
                 ))}
               </div>
@@ -488,7 +534,7 @@ export default function App() {
                         <td className="px-3 py-2 text-stone-600">{b.receivedBy || "—"}</td>
                         <td className="px-3 py-2 text-stone-600">{b.dispatchBy || "—"}</td>
                         <td className="px-3 py-2">
-                          <button onClick={() => removeBatch(b.id)} className="text-stone-400 hover:text-red-600">
+                          <button disabled={saving} onClick={() => removeBatch(b.id)} className="text-stone-400 hover:text-red-600 disabled:opacity-50">
                             <Trash2 size={15} />
                           </button>
                         </td>
@@ -503,7 +549,7 @@ export default function App() {
 
         {/* ---------------- ROSTER ---------------- */}
         {isMgr && tab === "roster" && (
-          <RosterPanel roster={roster} onAdd={addStaff} onToggle={toggleStaff}
+          <RosterPanel roster={roster} storageKind={dataService.status.kind} saving={saving} onAdd={addStaff} onToggle={toggleStaff}
             onRemove={removeStaff} onPin={changePin} />
         )}
       </main>
@@ -512,6 +558,7 @@ export default function App() {
       {tab === "batches" && session.role === "plant" && (
         <button
           onClick={() => setShowAdd(true)}
+          disabled={saving}
           className="fixed bottom-5 right-5 flex items-center gap-2 px-4 py-3 rounded-full bg-amber-500 hover:bg-amber-600 text-stone-900 font-semibold shadow-lg shadow-amber-500/30"
         >
           <Plus size={20} strokeWidth={2.5} /> Receive batch
@@ -519,11 +566,12 @@ export default function App() {
       )}
 
       {action && (
-        <ActionModal batch={action.batch} staff={activeStaff} shift={currentShift}
-          onClose={() => setAction(null)} onConfirm={applyAction} />
+        <ActionModal batch={action.batch} staff={activeStaff} shift={currentShift} saving={saving} error={saveError}
+          onClose={() => { if (!saving) setAction(null); }} onConfirm={applyAction} />
       )}
       {showAdd && (
-        <AddModal staff={activeStaff} shift={currentShift} onClose={() => setShowAdd(false)} onAdd={addBatch} />
+        <AddModal staff={activeStaff} shift={currentShift} saving={saving} error={saveError}
+          onClose={() => { if (!saving) setShowAdd(false); }} onAdd={addBatch} />
       )}
     </div>
   );
@@ -539,7 +587,7 @@ function Empty({ text }) {
   );
 }
 
-function BatchRow({ b, role, onAct, canDelete, onDelete }) {
+function BatchRow({ b, role, saving, onAct, canDelete, onDelete }) {
   const fl = flagsFor(b);
   const step = NEXT[b.status];
   const allowed = step && canActOn(role, b.status);
@@ -575,7 +623,7 @@ function BatchRow({ b, role, onAct, canDelete, onDelete }) {
 
         <div className="flex items-center gap-2 mt-2.5">
           {allowed ? (
-            <button onClick={onAct}
+            <button disabled={saving} onClick={onAct}
               className={`text-sm font-medium text-white px-3 py-1.5 rounded-md ${step.btn}`}>
               {step.label}
             </button>
@@ -583,7 +631,7 @@ function BatchRow({ b, role, onAct, canDelete, onDelete }) {
             <span className="text-xs text-stone-400">{waitingHint}</span>
           )}
           {canDelete && (
-            <button onClick={onDelete} className="ml-auto text-stone-300 hover:text-red-600">
+            <button disabled={saving} onClick={onDelete} className="ml-auto text-stone-300 hover:text-red-600 disabled:opacity-50">
               <Trash2 size={16} />
             </button>
           )}
@@ -622,7 +670,7 @@ function WhoSelect({ staff, value, onChange, shift }) {
   );
 }
 
-function ActionModal({ batch, staff, shift, onClose, onConfirm }) {
+function ActionModal({ batch, staff, shift, saving, error, onClose, onConfirm }) {
   const step = NEXT[batch.status];
   const [who, setWho] = useState("");
   const [piecesOut, setPiecesOut] = useState(batch.piecesIn ?? "");
@@ -663,16 +711,17 @@ function ActionModal({ batch, staff, shift, onClose, onConfirm }) {
           <WhoSelect staff={staff} value={who} onChange={setWho} shift={shift} />
         </div>
       </div>
-      <button disabled={!ok}
+      {error && <p role="alert" className="mt-4 text-sm text-red-700">{error}</p>}
+      <button disabled={!ok || saving}
         onClick={() => onConfirm(batch, who, { piecesOut, weightOut })}
         className={`w-full mt-5 py-2.5 rounded-md font-semibold text-white ${ok ? step.btn : "bg-stone-300"}`}>
-        {step.label}
+        {saving ? "Saving…" : step.label}
       </button>
     </Sheet>
   );
 }
 
-function AddModal({ staff, shift, onClose, onAdd }) {
+function AddModal({ staff, shift, saving, error, onClose, onAdd }) {
   const [f, setF] = useState({ jobNo: "", customer: "", parts: "", piecesIn: "", weightIn: "", receivedBy: "" });
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
   const ok = f.jobNo.trim() && f.customer.trim() && f.parts.trim() && f.receivedBy &&
@@ -698,15 +747,16 @@ function AddModal({ staff, shift, onClose, onAdd }) {
         <div><label className={lbl}>Received by</label>
           <WhoSelect staff={staff} value={f.receivedBy} onChange={(v) => setF({ ...f, receivedBy: v })} shift={shift} /></div>
       </div>
-      <button disabled={!ok} onClick={() => onAdd(f)}
+      {error && <p role="alert" className="mt-4 text-sm text-red-700">{error}</p>}
+      <button disabled={!ok || saving} onClick={() => onAdd(f)}
         className={`w-full mt-5 py-2.5 rounded-md font-semibold ${ok ? "bg-amber-500 hover:bg-amber-600 text-stone-900" : "bg-stone-300 text-white"}`}>
-        Log batch as received
+        {saving ? "Saving…" : "Log batch as received"}
       </button>
     </Sheet>
   );
 }
 
-function RolePicker({ correctPin, onPick }) {
+function RolePicker({ correctPin, storageKind, onPick }) {
   const [askPin, setAskPin] = useState(false);
   if (askPin)
     return (
@@ -726,7 +776,9 @@ function RolePicker({ correctPin, onPick }) {
         <div className="text-xl font-bold tracking-tight">AETE</div>
       </div>
       <p className="text-stone-400 text-sm mt-1 mb-8">Hot-Dip Galvanizing Tracker</p>
-      <p className="text-stone-500 text-xs -mt-6 mb-6">Demo data is saved on this device.</p>
+      <p className="text-stone-500 text-xs -mt-6 mb-6">
+        {storageKind === "firebase" ? "Demo data is shared through the local Firestore emulator." : "Demo data is saved on this device."}
+      </p>
       <div className="w-full max-w-sm space-y-3">
         <p className="text-xs text-stone-500">Who's using the tracker?</p>
         <PickBtn onClick={() => onPick({ role: "plant" })} icon={Package}
@@ -779,7 +831,7 @@ function PinCard({ correct, onBack, onOk }) {
   );
 }
 
-function RosterPanel({ roster, onAdd, onToggle, onRemove, onPin }) {
+function RosterPanel({ roster, storageKind, saving, onAdd, onToggle, onRemove, onPin }) {
   const [name, setName] = useState("");
   const [r, setR] = useState("Shift A Supervisor");
   const [shift, setShift] = useState("Shift A");
@@ -808,7 +860,7 @@ function RosterPanel({ roster, onAdd, onToggle, onRemove, onPin }) {
               <option>Shift A</option>
               <option>Shift B</option>
             </select>
-            <button onClick={() => { onAdd(name, r, shift); setName(""); }}
+            <button disabled={saving} onClick={async () => { if (await onAdd(name, r, shift)) setName(""); }}
               className="px-4 shrink-0 rounded-md bg-amber-500 hover:bg-amber-600 text-stone-900"><Plus size={18} /></button>
           </div>
         </div>
@@ -821,11 +873,11 @@ function RosterPanel({ roster, onAdd, onToggle, onRemove, onPin }) {
               <div className="font-medium">{s.name}</div>
               <div className="text-xs text-stone-500">{s.role}{s.shift ? ` · ${s.shift}` : ""}</div>
             </div>
-            <button onClick={() => onToggle(s.id)}
+            <button disabled={saving} onClick={() => onToggle(s.id)}
               className={`text-xs px-2.5 py-1 rounded-full border ${s.active ? "bg-emerald-100 text-emerald-800 border-emerald-200" : "bg-stone-100 text-stone-500 border-stone-200"}`}>
               {s.active ? "Active" : "Off"}
             </button>
-            <button onClick={() => onRemove(s.id)} className="text-stone-300 hover:text-red-600"><Trash2 size={16} /></button>
+            <button disabled={saving} onClick={() => onRemove(s.id)} className="text-stone-300 hover:text-red-600 disabled:opacity-50"><Trash2 size={16} /></button>
           </div>
         ))}
       </section>
@@ -834,10 +886,12 @@ function RosterPanel({ roster, onAdd, onToggle, onRemove, onPin }) {
         <h2 className="font-semibold text-sm mb-2">Manager PIN</h2>
         <div className="flex gap-2">
           <input type="password" className={field} placeholder="New PIN" value={newPin} onChange={(e) => setNewPin(e.target.value)} />
-          <button onClick={() => { if (newPin.trim()) { onPin(newPin.trim()); setNewPin(""); } }}
+          <button disabled={saving} onClick={async () => { if (newPin.trim() && await onPin(newPin.trim())) setNewPin(""); }}
             className="px-4 rounded-md bg-stone-900 text-white text-sm hover:bg-stone-800">Update</button>
         </div>
-        <p className="text-xs text-stone-400 mt-2">This PIN is stored only in this browser.</p>
+        <p className="text-xs text-stone-400 mt-2">
+          {storageKind === "firebase" ? "This demo PIN is stored in the local Firestore emulator." : "This PIN is stored only in this browser."}
+        </p>
       </section>
     </div>
   );

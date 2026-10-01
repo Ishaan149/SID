@@ -1,0 +1,11 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // LOCAL EMULATOR ONLY: the current tracker has a UI-only role/PIN gate and
+    // no Firebase Auth. Add Firebase Auth and replace this with request.auth
+    // checks before deploying these rules to a real project.
+    match /{document=**} {
+      allow read, write: if true;
+    }
+  }
+}
