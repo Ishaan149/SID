@@ -1,89 +1,70 @@
 import { createFirebaseAdapter } from "./firebaseAdapter.js";
-import { createLocalStorageAdapter } from "./localStorageAdapter.js";
-export function createDataService({ adapter, fallback = createLocalStorageAdapter() } = {}) {
-  let active = adapter;
-  let fallbackUsed = false;
-  let snapshot = null;
-  let pending = Promise.resolve();
+import { getFirebaseClient } from "./firebaseClient.js";
+import { createPendingJournal } from "./pendingRequests.js";
+import { newId, trackerError } from "./mutations.js";
 
-  const switchToLocal = async () => {
-    if (snapshot) {
-      // Preserve the Firestore data already on screen before replaying a failed write.
-      await fallback.replace("batches", snapshot.batches);
-      await fallback.replace("roster", snapshot.roster);
-      await fallback.replace("activity", snapshot.activity);
-      await fallback.updateSettings(snapshot.settings);
+export function createDataService({ adapter, journal, getSession = () => ({ permissionsVerified: true }) }) {
+  let data = null;
+  let connection = { connected: false, error: null };
+  let busy = false;
+  const subscribers = new Set();
+  const emit = () => { for (const notify of subscribers) notify(data, { ...connection, busy, pendingRequest: journal.current }); };
+  const mutate = async (kind, input) => {
+    if (busy) throw trackerError("busy", "A save is already in progress.");
+    if (!connection.connected || getSession()?.permissionsVerified !== true) {
+      throw trackerError("offline", "Shared data is not connected. Reconnect before saving; no browser-only changes will be made.");
     }
-    active = fallback;
-    fallbackUsed = true;
-  };
-  const withFallback = async (operation) => {
+    journal.remember(kind, input);
+    busy = true;
+    emit();
     try {
-      return await operation(active);
+      const result = await adapter[kind](input);
+      journal.clear();
+      return result;
     } catch (error) {
-      if (active?.kind !== "firebase" || !fallback) throw error;
-      console.warn("Firebase unavailable; using localStorage fallback.", error);
-      await switchToLocal();
-      return operation(active);
+      if (!error.uncertain) journal.clear();
+      throw error;
+    } finally {
+      busy = false;
+      emit();
     }
   };
-  // A failed write must copy a complete, committed snapshot to localStorage.
-  const write = (operation, updateSnapshot) => {
-    const result = pending.then(async () => {
-      const value = await withFallback(operation);
-      if (snapshot) snapshot = updateSnapshot(snapshot);
-      return value;
-    });
-    pending = result.catch(() => {});
-    return result;
-  };
-  const add = (collection, value) => write(
-    (a) => a.create(collection, value),
-    (data) => ({ ...data, [collection]: [...data[collection], value] }),
-  );
-  const update = (collection, id, patch) => write(
-    (a) => a.update(collection, id, patch),
-    (data) => ({ ...data, [collection]: data[collection].map((item) => item.id === id ? { ...item, ...patch } : item) }),
-  );
-  const remove = (collection, id) => write(
-    (a) => a.remove(collection, id),
-    (data) => ({ ...data, [collection]: data[collection].filter((item) => item.id !== id) }),
-  );
-  return {
-    async load() {
-      await pending;
-      snapshot = await withFallback((a) => a.load());
-      return snapshot;
+  const service = {
+    subscribe(notify) {
+      subscribers.add(notify);
+      const stop = adapter.subscribe((next, status) => {
+        data = next;
+        connection = status;
+        emit();
+      }, (error) => {
+        connection = { connected: false, error };
+        emit();
+      });
+      notify(data, { ...connection, busy, pendingRequest: journal.current });
+      return () => { subscribers.delete(notify); stop(); };
     },
-    addBatch: (batch) => add("batches", batch),
-    updateBatch: (id, patch) => update("batches", id, patch),
-    deleteBatch: (id) => remove("batches", id),
-    addActivity: (entry) => add("activity", entry),
-    addStaff: (staff) => add("roster", staff),
-    updateStaff: (id, patch) => update("roster", id, patch),
-    deleteStaff: (id) => remove("roster", id),
-    updateSettings: (patch) => write(
-      (a) => a.updateSettings(patch),
-      (data) => ({ ...data, settings: { ...data.settings, ...patch } }),
-    ),
-    seed: (data) => write(
-      async (a) => {
-        await a.replace("batches", data.batches);
-        await a.replace("roster", data.roster);
-        await a.replace("activity", data.activity);
-        await a.updateSettings(data.settings);
-        return data;
-      },
-      () => data,
-    ),
-    get status() { return { kind: active?.kind || "none", fallbackUsed }; },
+    subscribeHistory: (...args) => adapter.subscribeHistory(...args),
+    receiveBatch: (input) => mutate("receiveBatch", input),
+    transitionBatch: (input) => mutate("transitionBatch", input),
+    archiveBatch: (input) => mutate("archiveBatch", input),
+    addStaff: (input) => mutate("addStaff", input),
+    setStaffActive: (input) => mutate("setStaffActive", input),
+    removeStaff: (input) => mutate("removeStaff", input),
+    retryPending: () => {
+      const request = journal.current;
+      return request ? mutate(request.kind, request.input) : Promise.resolve(null);
+    },
+    newRequest: () => ({ id: newId(), mutationId: newId() }),
+    get status() { return { kind: "firebase", ...connection, busy, pendingRequest: journal.current }; },
   };
+  return service;
 }
-
-export function createConfiguredDataService() {
-  const env = import.meta.env || {};
-  const mode = env.VITE_DATA_ADAPTER || (env.DEV ? "firebase" : "local");
-  return mode === "local"
-    ? createDataService({ adapter: createLocalStorageAdapter() })
-    : createDataService({ adapter: createFirebaseAdapter(), fallback: createLocalStorageAdapter() });
+export function createConfiguredDataService({ uid, getSession }) {
+  const client = getFirebaseClient();
+  let storage;
+  try { storage = window.sessionStorage; } catch { /* Optional journal persistence. */ }
+  return createDataService({
+    adapter: createFirebaseAdapter({ client, expectedUid: uid }), getSession,
+    journal: createPendingJournal(storage, client.app.options.projectId, uid),
+  });
 }

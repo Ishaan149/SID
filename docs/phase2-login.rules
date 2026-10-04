@@ -1,0 +1,15 @@
+// Reference copy of the Phase 2 rules currently published by the user.
+// Do not replace these in the real project until Phase 4 integration is tested
+// and publication is approved. firestore.rules contains the staged Phase 3 rules.
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /users/{uid} {
+      allow get: if request.auth != null && request.auth.uid == uid;
+      allow list, create, update, delete: if false;
+    }
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

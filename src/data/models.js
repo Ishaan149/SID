@@ -5,7 +5,7 @@ export const COLLECTIONS = Object.freeze({
   settings: "settings",
 });
 
-export const DEFAULT_SETTINGS = Object.freeze({ pin: "1234" });
+export const DEFAULT_SETTINGS = Object.freeze({});
 
 export function emptyTrackerData() {
   return { batches: [], roster: [], activity: [], settings: { ...DEFAULT_SETTINGS } };

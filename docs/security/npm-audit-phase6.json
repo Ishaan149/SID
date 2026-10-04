@@ -1,0 +1,209 @@
+{
+  "auditReportVersion": 2,
+  "vulnerabilities": {
+    "braces": {
+      "name": "braces",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        {
+          "source": 1240992,
+          "name": "braces",
+          "dependency": "braces",
+          "title": "braces vulnerable to stack-exhaustion denial of service through deeply nested patterns",
+          "url": "https://github.com/advisories/GHSA-vfj7-8cjw-p6xm",
+          "severity": "high",
+          "cwe": [
+            "CWE-674"
+          ],
+          "cvss": {
+            "score": 7.5,
+            "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+          },
+          "range": "<=3.0.3"
+        }
+      ],
+      "effects": [
+        "chokidar"
+      ],
+      "range": "*",
+      "nodes": [
+        "node_modules/braces"
+      ],
+      "fixAvailable": {
+        "name": "firebase-tools",
+        "version": "15.32.1",
+        "isSemVerMajor": true
+      }
+    },
+    "chokidar": {
+      "name": "chokidar",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        "braces"
+      ],
+      "effects": [
+        "firebase-tools"
+      ],
+      "range": "2.0.0 - 3.6.0",
+      "nodes": [
+        "node_modules/chokidar"
+      ],
+      "fixAvailable": {
+        "name": "firebase-tools",
+        "version": "15.32.1",
+        "isSemVerMajor": true
+      }
+    },
+    "firebase-tools": {
+      "name": "firebase-tools",
+      "severity": "high",
+      "isDirect": true,
+      "via": [
+        "chokidar",
+        "stream-json"
+      ],
+      "effects": [],
+      "range": ">=6.9.0",
+      "nodes": [
+        "node_modules/firebase-tools"
+      ],
+      "fixAvailable": {
+        "name": "firebase-tools",
+        "version": "15.32.1",
+        "isSemVerMajor": true
+      }
+    },
+    "re2": {
+      "name": "re2",
+      "severity": "moderate",
+      "isDirect": false,
+      "via": [
+        {
+          "source": 1130576,
+          "name": "re2",
+          "dependency": "re2",
+          "title": "re2: Out-of-bounds heap read in `exec`/`test`/`match` via attacker-influenced `lastIndex` on a non-ASCII subject → uncatchable process crash (DoS)",
+          "url": "https://github.com/advisories/GHSA-ff84-5f28-78qj",
+          "severity": "moderate",
+          "cwe": [
+            "CWE-125"
+          ],
+          "cvss": {
+            "score": 5.7,
+            "vectorString": "CVSS:3.1/AV:L/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:H"
+          },
+          "range": "<=1.25.1"
+        },
+        {
+          "source": 1130577,
+          "name": "re2",
+          "dependency": "re2",
+          "title": "re2: Global `String.prototype.match` with an empty-matchable pattern never advances → infinite loop with unbounded native memory growth (DoS)",
+          "url": "https://github.com/advisories/GHSA-6hxr-mr5r-9836",
+          "severity": "moderate",
+          "cwe": [
+            "CWE-835"
+          ],
+          "cvss": {
+            "score": 6.2,
+            "vectorString": "CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+          },
+          "range": "<=1.25.1"
+        },
+        {
+          "source": 1138117,
+          "name": "re2",
+          "dependency": "re2",
+          "title": "node-re2: Out-of-bounds heap read in `replace`/`split` via a `Buffer` ending in a truncated multi-byte UTF-8 character → adjacent heap memory disclosed to JavaScript",
+          "url": "https://github.com/advisories/GHSA-j4r3-hg7j-8chg",
+          "severity": "moderate",
+          "cwe": [
+            "CWE-125"
+          ],
+          "cvss": {
+            "score": 5.1,
+            "vectorString": "CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:L"
+          },
+          "range": "<=1.26.0"
+        },
+        {
+          "source": 1138118,
+          "name": "re2",
+          "dependency": "re2",
+          "title": "node-re2: String.prototype.replace(re2, template) aborts the Node process (uncatchable ToLocalChecked on empty MaybeLocal) when the result exceeds V8's max string length",
+          "url": "https://github.com/advisories/GHSA-8hcv-x26h-mcgp",
+          "severity": "moderate",
+          "cwe": [
+            "CWE-617"
+          ],
+          "cvss": {
+            "score": 6.2,
+            "vectorString": "CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+          },
+          "range": "<=1.25.0"
+        }
+      ],
+      "effects": [],
+      "range": "<=1.26.0",
+      "nodes": [
+        "node_modules/re2"
+      ],
+      "fixAvailable": true
+    },
+    "stream-json": {
+      "name": "stream-json",
+      "severity": "moderate",
+      "isDirect": false,
+      "via": [
+        {
+          "source": 1164823,
+          "name": "stream-json",
+          "dependency": "stream-json",
+          "title": "stream-json: pick/ignore/filter/replace filters are O(depth²) on nested input — small crafted JSON blocks the event loop for seconds→minutes (DoS)",
+          "url": "https://github.com/advisories/GHSA-528h-pc64-c93x",
+          "severity": "moderate",
+          "cwe": [
+            "CWE-407"
+          ],
+          "cvss": {
+            "score": 6.2,
+            "vectorString": "CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+          },
+          "range": "<=3.4.0"
+        }
+      ],
+      "effects": [
+        "firebase-tools"
+      ],
+      "range": "<=3.4.0",
+      "nodes": [
+        "node_modules/stream-json"
+      ],
+      "fixAvailable": {
+        "name": "firebase-tools",
+        "version": "15.32.1",
+        "isSemVerMajor": true
+      }
+    }
+  },
+  "metadata": {
+    "vulnerabilities": {
+      "info": 0,
+      "low": 0,
+      "moderate": 2,
+      "high": 3,
+      "critical": 0,
+      "total": 5
+    },
+    "dependencies": {
+      "prod": 91,
+      "dev": 683,
+      "optional": 92,
+      "peer": 0,
+      "peerOptional": 0,
+      "total": 773
+    }
+  }
+}

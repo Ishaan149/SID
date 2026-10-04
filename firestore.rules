@@ -1,11 +1,186 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // LOCAL EMULATOR ONLY: the current tracker has a UI-only role/PIN gate and
-    // no Firebase Auth. Add Firebase Auth and replace this with request.auth
-    // checks before deploying these rules to a real project.
+    function accountPath() {
+      return /databases/$(database)/documents/users/$(request.auth.uid);
+    }
+    function member() {
+      return request.auth != null && exists(accountPath())
+        && get(accountPath()).data.active == true
+        && get(accountPath()).data.role in ['manager', 'plant', 'shiftA', 'shiftB'];
+    }
+    function roleIs(role) {
+      return member() && get(accountPath()).data.role == role;
+    }
+    function validId(id) {
+      return id is string && id.matches('^[A-Za-z0-9_-]{1,128}$');
+    }
+    function text(value, max) {
+      return value is string && value.size() > 0 && value.size() <= max
+        && value.matches('(?s).*\\S.*');
+    }
+    function pieces(value) {
+      return value is int && value >= 0 && value <= 1000000000;
+    }
+    function weight(value) {
+      // The upper bound also rejects Infinity; comparisons reject NaN.
+      return value is number && value >= 0 && value <= 1000000000000;
+    }
+    function baseFields() {
+      return ['id', 'jobNo', 'customer', 'parts', 'piecesIn', 'weightIn', 'status',
+        'receivedBy', 'receivedStaffId', 'receivedShift', 'receivedAt', 'receivedUid',
+        'notes', 'version', 'archived', 'updatedAt', 'lastEventId'];
+    }
+    function processFields() {
+      return ['processBy', 'processStaffId', 'processShift', 'processAt', 'processUid'];
+    }
+    function readyFields() {
+      return ['readyBy', 'readyStaffId', 'readyShift', 'readyAt', 'readyUid', 'piecesOut', 'weightOut'];
+    }
+    function dispatchFields() {
+      return ['dispatchBy', 'dispatchStaffId', 'dispatchShift', 'dispatchAt', 'dispatchUid'];
+    }
+    function archiveFields() {
+      return ['archivedAt', 'archivedUid', 'archiveReason'];
+    }
+    function fieldsFor(status) {
+      return status == 'Received' ? baseFields()
+        : status == 'Processing' ? baseFields().concat(processFields())
+        : status == 'Ready' ? baseFields().concat(processFields()).concat(readyFields())
+        : baseFields().concat(processFields()).concat(readyFields()).concat(dispatchFields());
+    }
+    function validNewBatch(b, id) {
+      return validId(id) && b.keys().hasAll(baseFields()) && b.keys().hasOnly(baseFields())
+        && b.id == id && text(b.jobNo, 80) && text(b.customer, 200) && text(b.parts, 500)
+        && pieces(b.piecesIn) && weight(b.weightIn)
+        && text(b.receivedBy, 120) && validId(b.receivedStaffId) && b.receivedShift == 'Plant'
+        && b.notes is string && b.notes.size() <= 2000
+        && b.archived == false && b.version is int && b.version == 1
+        && validId(b.lastEventId) && b.updatedAt == request.time;
+    }
+    function validUpdate(b, id) {
+      let fields = fieldsFor(b.status).concat(b.archived ? archiveFields() : []);
+      // Immutable history was validated when created. Each transition below
+      // validates its new fields and permits changes ONLY to those fields.
+      return b.id == id && b.keys().hasAll(fields) && b.keys().hasOnly(fields)
+        && b.status in ['Received', 'Processing', 'Ready', 'Dispatched']
+        && b.archived is bool && b.version is int && b.version > 0 && b.version <= 1000000000
+        && validId(b.lastEventId) && b.updatedAt == request.time;
+    }
+    function selectedStaff(id, name, shift) {
+      let path = /databases/$(database)/documents/roster/$(id);
+      return validId(id) && text(name, 120) && exists(path) && get(path).data.active == true
+        && get(path).data.name == name && get(path).data.shift == shift;
+    }
+    function eventMatches(e, b, eventId) {
+      return e.keys().hasAll(['id', 'batchId', 'version', 'at', 'action', 'actorUid',
+          'staffId', 'who', 'shift', 'jobNo', 'beforeStatus', 'afterStatus', 'snapshot'])
+        && e.keys().hasOnly(['id', 'batchId', 'version', 'at', 'action', 'actorUid',
+          'staffId', 'who', 'shift', 'jobNo', 'beforeStatus', 'afterStatus', 'snapshot'])
+        && e.id == eventId && b.lastEventId == eventId && validId(eventId)
+        && e.batchId == b.id && e.version is int && e.version == b.version && e.at == request.time
+        && e.actorUid == request.auth.uid && e.jobNo == b.jobNo
+        && e.afterStatus == b.status && e.snapshot == b
+        && ((b.archived && e.action == 'Archived' && e.staffId == null
+              && e.who == 'Manager' && e.shift == null && b.archivedUid == e.actorUid)
+          || (!b.archived && (
+            (b.status == 'Received' && e.action == 'Received' && e.staffId == b.receivedStaffId
+              && e.who == b.receivedBy && e.shift == b.receivedShift && e.actorUid == b.receivedUid)
+            || (b.status == 'Processing' && e.action == 'Into process' && e.staffId == b.processStaffId
+              && e.who == b.processBy && e.shift == b.processShift && e.actorUid == b.processUid)
+            || (b.status == 'Ready' && e.action == 'Ready' && e.staffId == b.readyStaffId
+              && e.who == b.readyBy && e.shift == b.readyShift && e.actorUid == b.readyUid)
+            || (b.status == 'Dispatched' && e.action == 'Dispatched' && e.staffId == b.dispatchStaffId
+              && e.who == b.dispatchBy && e.shift == b.dispatchShift && e.actorUid == b.dispatchUid)
+          )));
+    }
+    function pairedEvent(b, beforeStatus) {
+      let path = /databases/$(database)/documents/activity/$(b.lastEventId);
+      // The activity create rule validates the event; require that exact new
+      // event and its complete snapshot in this same atomic commit.
+      return !exists(path) && getAfter(path).data.snapshot == b
+        && getAfter(path).data.beforeStatus == beforeStatus;
+    }
+    function receive(b) {
+      return roleIs('plant') && b.status == 'Received' && !b.archived && b.version == 1
+        && b.receivedAt == request.time && b.receivedUid == request.auth.uid
+        && selectedStaff(b.receivedStaffId, b.receivedBy, 'Plant') && pairedEvent(b, null);
+    }
+    function progress(a, b) {
+      let changed = b.diff(a).affectedKeys();
+      let audit = ['status', 'version', 'updatedAt', 'lastEventId'];
+      let role = get(accountPath()).data.role;
+      let shift = role == 'shiftA' ? 'Shift A' : 'Shift B';
+      return !b.archived && (
+        (a.status == 'Received' && b.status == 'Processing' && role in ['shiftA', 'shiftB']
+          && changed.hasOnly(audit.concat(processFields()))
+          && b.processAt == request.time && b.processAt >= a.receivedAt && b.processUid == request.auth.uid
+          && b.processShift == shift && selectedStaff(b.processStaffId, b.processBy, shift))
+        || (a.status == 'Processing' && b.status == 'Ready' && role in ['shiftA', 'shiftB']
+          && changed.hasOnly(audit.concat(readyFields()))
+          && b.readyAt == request.time && b.readyAt >= a.processAt && b.readyUid == request.auth.uid
+          && b.readyShift == shift && pieces(b.piecesOut) && weight(b.weightOut)
+          && selectedStaff(b.readyStaffId, b.readyBy, shift))
+        || (a.status == 'Ready' && b.status == 'Dispatched' && role == 'plant'
+          && changed.hasOnly(audit.concat(dispatchFields()))
+          && b.dispatchAt == request.time && b.dispatchAt >= a.readyAt && b.dispatchUid == request.auth.uid
+          && b.dispatchShift == 'Plant' && selectedStaff(b.dispatchStaffId, b.dispatchBy, 'Plant'))
+      );
+    }
+    function archive(a, b) {
+      return roleIs('manager') && b.archived && b.status == a.status
+        && b.diff(a).affectedKeys().hasOnly(['archived', 'archivedAt', 'archivedUid',
+          'archiveReason', 'version', 'updatedAt', 'lastEventId'])
+        && b.archivedAt == request.time && b.archivedAt >= a.updatedAt && b.archivedUid == request.auth.uid
+        && text(b.archiveReason, 500);
+    }
+    function validRoster(s, id) {
+      return validId(id) && s.keys().hasAll(['id', 'name', 'role', 'shift', 'active'])
+        && s.keys().hasOnly(['id', 'name', 'role', 'shift', 'active']) && s.id == id
+        && text(s.name, 120) && s.active is bool
+        && ((s.role == 'Plant Supervisor' && s.shift == 'Plant')
+          || (s.role == 'Shift A Supervisor' && s.shift == 'Shift A')
+          || (s.role == 'Shift B Supervisor' && s.shift == 'Shift B')
+          || (s.role == 'Operations Manager' && s.shift == null));
+    }
+
+    // Login roles remain console-managed; managers cannot promote any account.
+    match /users/{uid} {
+      allow get: if request.auth != null && request.auth.uid == uid;
+      allow list, create, update, delete: if false;
+    }
+    match /batches/{id} {
+      allow read: if member();
+      allow create: if receive(request.resource.data) && validNewBatch(request.resource.data, id);
+      allow update: if member() && !resource.data.archived
+        && validUpdate(request.resource.data, id)
+        && request.resource.data.version == resource.data.version + 1
+        && (progress(resource.data, request.resource.data) || archive(resource.data, request.resource.data))
+        && pairedEvent(request.resource.data, resource.data.status);
+      allow delete: if false;
+    }
+    match /activity/{id} {
+      allow read: if member();
+      allow create: if member() && activityForNewRevision(request.resource.data, id);
+      allow update, delete: if false;
+
+      function activityForNewRevision(e, id) {
+        let path = /databases/$(database)/documents/batches/$(e.batchId);
+        let b = getAfter(path).data;
+        return validId(e.batchId) && eventMatches(e, b, id) && b.updatedAt == request.time
+          && ((!exists(path) && b.version == 1 && e.beforeStatus == null)
+            || (exists(path) && b.version == get(path).data.version + 1
+              && e.beforeStatus == get(path).data.status));
+      }
+    }
+    match /roster/{id} {
+      allow read: if member();
+      allow create, update: if roleIs('manager') && validRoster(request.resource.data, id);
+      allow delete: if roleIs('manager');
+    }
+    // Unknown collections, nested documents, and legacy PIN settings stay closed.
     match /{document=**} {
-      allow read, write: if true;
+      allow read, write: if false;
     }
   }
 }
