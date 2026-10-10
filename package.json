@@ -12,7 +12,7 @@
     "firebase:seed": "node scripts/seed-emulator.mjs",
     "firebase:reset": "firebase emulators:start --project demo-aete --only auth,firestore --export-on-exit=./.firebase-data --import=./.firebase-data",
     "test": "node --test",
-    "test:rules": "firebase emulators:exec --project demo-aete --config firebase.test.json --only auth,firestore \"node --test test/auth-rules.test.mjs test/firebase-login.test.mjs test/tracker-rules.test.mjs test/firebase-data.test.mjs\""
+    "test:rules": "firebase emulators:exec --project demo-aete --config firebase.test.json --only auth,firestore \"node --test --test-concurrency=1 test/auth-rules.test.mjs test/firebase-login.test.mjs test/tracker-rules.test.mjs test/firebase-data.test.mjs\""
   },
   "dependencies": {
     "firebase": "^11.10.0",

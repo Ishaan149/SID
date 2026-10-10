@@ -4,7 +4,8 @@ import {
   runTransaction, serverTimestamp, where,
 } from "firebase/firestore";
 import {
-  activityFor, dateOf, requireId, requireQuantity, requireRevision, requireRole,
+  activityFor, CORRECTABLE_FIELDS, correctionChanges, requireCorrectionRevision,
+  requireId, requireQuantity, requireRevision, requireRole,
   requireStaff, requireText, roleShift, saveFailure, STAFF_SHIFTS, trackerError,
 } from "./mutations.js";
 
@@ -24,7 +25,7 @@ export function createFirebaseAdapter({ client = getFirebaseClient(), expectedUi
   };
   function confirmedEvent(event, kind, input, uid) {
     const snapshot = event?.snapshot;
-    const action = kind === "receiveBatch" ? "Received" : kind === "archiveBatch" ? "Archived"
+    const action = kind === "receiveBatch" ? "Received" : kind === "archiveBatch" ? "Archived" : kind === "correctBatch" ? "Corrected"
       : { Received: "Into process", Processing: "Ready", Ready: "Dispatched" }[input.expectedStatus];
     if (event.actorUid !== uid || event.batchId !== input.id || event.action !== action) {
       throw trackerError("conflict", "This request ID belongs to a different operation. Review the latest data.");
@@ -34,6 +35,10 @@ export function createFirebaseAdapter({ client = getFirebaseClient(), expectedUi
         && snapshot.piecesIn === input.piecesIn && snapshot.weightIn === input.weightIn && snapshot.receivedStaffId === input.staffId
         && snapshot.notes === input.notes
       : kind === "archiveBatch" ? snapshot.archiveReason === input.reason && event.version === input.expectedVersion + 1
+      : kind === "correctBatch" ? event.reason === input.reason && event.version === input.expectedVersion + 1
+        && event.beforeStatus === input.expectedStatus && event.beforeSnapshot?.archived === input.expectedArchived
+        && correctionChanges(event.beforeSnapshot, snapshot).length === Object.keys(input.changes).length
+        && Object.entries(input.changes).every(([key, value]) => snapshot[key] === value && event.beforeSnapshot[key] !== value)
       : event.staffId === input.staffId && event.beforeStatus === input.expectedStatus && event.version === input.expectedVersion + 1
         && (input.expectedStatus !== "Processing" || (snapshot.piecesOut === input.piecesOut && snapshot.weightOut === input.weightOut));
     if (!matches) throw trackerError("already-saved", "The earlier request was already saved with different form details. Close this form and review the saved record.");
@@ -41,26 +46,46 @@ export function createFirebaseAdapter({ client = getFirebaseClient(), expectedUi
   }
   function normalize(kind, raw) {
     const input = { ...raw, id: requireId(raw.id) };
-    if (["receiveBatch", "transitionBatch", "archiveBatch"].includes(kind)) input.mutationId = requireId(raw.mutationId);
+    if (["receiveBatch", "transitionBatch", "archiveBatch", "correctBatch"].includes(kind)) input.mutationId = requireId(raw.mutationId);
     if (kind === "receiveBatch") {
       input.jobNo = requireText(raw.jobNo, "Job number", 80);
       input.customer = requireText(raw.customer, "Customer", 200);
       input.parts = requireText(raw.parts, "Parts", 500);
       input.piecesIn = requireQuantity(raw.piecesIn, "Pieces in", true);
       input.weightIn = requireQuantity(raw.weightIn, "Weight in");
-      input.staffId = requireId(raw.staffId);
+      input.staffId = raw.staffId == null ? null : requireId(raw.staffId);
       input.notes = raw.notes || "";
       if (typeof input.notes !== "string" || input.notes.length > 2000) throw trackerError("invalid-input", "Notes must be at most 2,000 characters.");
     }
     if (kind === "transitionBatch") {
-      input.staffId = requireId(raw.staffId);
+      input.staffId = raw.staffId == null ? null : requireId(raw.staffId);
       if (raw.expectedStatus === "Processing") {
         input.piecesOut = requireQuantity(raw.piecesOut, "Pieces out", true);
         input.weightOut = requireQuantity(raw.weightOut, "Weight out");
       }
     }
     if (kind === "archiveBatch") input.reason = requireText(raw.reason, "Archive reason", 500);
-    if (kind === "transitionBatch" || kind === "archiveBatch") {
+    if (kind === "correctBatch") {
+      input.reason = requireText(raw.reason, "Correction reason", 500);
+      if (!raw.changes || typeof raw.changes !== "object" || Array.isArray(raw.changes) ||
+        !Object.keys(raw.changes).length || Object.keys(raw.changes).some((key) => !CORRECTABLE_FIELDS.includes(key))) {
+        throw trackerError("invalid-input", "Choose at least one valid batch detail to correct.");
+      }
+      input.changes = {};
+      for (const [key, value] of Object.entries(raw.changes)) {
+        if (key === "notes") {
+          if (typeof value !== "string" || value.length > 2000) throw trackerError("invalid-input", "Notes must be at most 2,000 characters.");
+          input.changes[key] = value;
+        } else if (key === "piecesIn" || key === "piecesOut" || key === "weightIn" || key === "weightOut") {
+          input.changes[key] = requireQuantity(value, key, key.startsWith("pieces"));
+        } else input.changes[key] = requireText(value, key, key === "jobNo" ? 80 : key === "customer" ? 200 : 500);
+      }
+      if (typeof raw.expectedArchived !== "boolean") throw trackerError("invalid-input", "This batch needs to be reloaded before correction.");
+      if (["piecesOut", "weightOut"].some((key) => key in input.changes) && !["Ready", "Dispatched"].includes(raw.expectedStatus)) {
+        throw trackerError("invalid-input", "Output quantities are only available after the batch is ready.");
+      }
+    }
+    if (["transitionBatch", "archiveBatch", "correctBatch"].includes(kind)) {
       if (!Number.isInteger(raw.expectedVersion) || !["Received", "Processing", "Ready", "Dispatched"].includes(raw.expectedStatus)) {
         throw trackerError("invalid-input", "This batch needs to be reloaded before it can be changed.");
       }
@@ -84,33 +109,46 @@ export function createFirebaseAdapter({ client = getFirebaseClient(), expectedUi
         ]);
         if (receipt.exists()) return confirmedEvent(receipt.data(), kind, input, uid);
         const profile = account.data();
+        if (profile?.entry === "quick" && ["receiveBatch", "transitionBatch"].includes(kind) && input.staffId !== profile.staffId) {
+          throw trackerError("invalid-staff", "Your chosen name must be used for this action. Leave and enter again to switch users.");
+        }
         const previous = stored.exists() ? stored.data() : null;
         let next;
+        let correction = null;
         if (kind === "receiveBatch") {
-          requireRole(profile, ["plant"]);
+          const role = requireRole(profile, ["plant", "manager"]);
           if (previous) throw trackerError("conflict", "This batch ID already exists. Review the saved batches.");
-          const staff = (await tx.get(doc(db, "roster", input.staffId))).data();
-          requireStaff(staff, "Plant");
+          if (role === "manager" && input.staffId !== null) throw trackerError("invalid-staff", "Manager actions must use the manager account.");
+          const staff = role === "manager" ? null : (await tx.get(doc(db, "roster", requireId(input.staffId)))).data();
+          if (role !== "manager") requireStaff(staff, "Plant");
           next = {
             id: input.id, jobNo: input.jobNo, customer: input.customer, parts: input.parts,
             piecesIn: input.piecesIn, weightIn: input.weightIn, notes: input.notes,
-            status: "Received", receivedStaffId: staff.id, receivedBy: staff.name, receivedShift: "Plant",
+            status: "Received", receivedStaffId: staff?.id ?? null, receivedBy: staff?.name ?? "Manager", receivedShift: staff?.shift ?? null,
             receivedUid: uid, receivedAt: serverTimestamp(), version: 1, archived: false,
           };
         } else {
-          requireRevision(previous, input);
-          if (kind === "archiveBatch") {
+          if (kind === "correctBatch") requireCorrectionRevision(previous, input);
+          else requireRevision(previous, input);
+          if (kind === "correctBatch") {
+            requireRole(profile, ["manager"]);
+            const changes = Object.fromEntries(Object.entries(input.changes).filter(([key, value]) => previous[key] !== value));
+            if (Object.keys(changes).length !== Object.keys(input.changes).length) throw trackerError("invalid-input", "Every selected correction must change a value.");
+            next = { ...previous, ...changes };
+            correction = { before: previous, reason: input.reason };
+          } else if (kind === "archiveBatch") {
             requireRole(profile, ["manager"]);
             next = { ...previous, archived: true, archivedAt: serverTimestamp(), archivedUid: uid, archiveReason: input.reason };
           } else {
-            const role = requireRole(profile, previous.status === "Ready" ? ["plant"] : ["shiftA", "shiftB"]);
+            const role = requireRole(profile, previous.status === "Ready" ? ["plant", "manager"] : ["shiftA", "shiftB", "manager"]);
             const shift = roleShift(role);
-            const staff = (await tx.get(doc(db, "roster", input.staffId))).data();
-            requireStaff(staff, shift);
+            if (role === "manager" && input.staffId !== null) throw trackerError("invalid-staff", "Manager actions must use the manager account.");
+            const staff = role === "manager" ? null : (await tx.get(doc(db, "roster", requireId(input.staffId)))).data();
+            if (role !== "manager") requireStaff(staff, shift);
             const status = { Received: "Processing", Processing: "Ready", Ready: "Dispatched" }[previous.status];
             if (!status) throw trackerError("conflict", "This batch has already been dispatched.");
             const prefix = { Processing: "process", Ready: "ready", Dispatched: "dispatch" }[status];
-            next = { ...previous, status, [`${prefix}StaffId`]: staff.id, [`${prefix}By`]: staff.name,
+            next = { ...previous, status, [`${prefix}StaffId`]: staff?.id ?? null, [`${prefix}By`]: staff?.name ?? "Manager",
               [`${prefix}Shift`]: shift, [`${prefix}Uid`]: uid, [`${prefix}At`]: serverTimestamp(),
               ...(status === "Ready" ? { piecesOut: input.piecesOut, weightOut: input.weightOut } : {}),
             };
@@ -122,7 +160,7 @@ export function createFirebaseAdapter({ client = getFirebaseClient(), expectedUi
         signedInUid();
         attemptedWrite = true;
         tx.set(batchRef, next);
-        tx.set(eventRef, activityFor(next, previous?.status || null, uid));
+        tx.set(eventRef, activityFor(next, previous?.status || null, uid, correction));
         return { id: input.id, replayed: false };
       }, { maxAttempts: 3 });
     } catch (error) {
@@ -134,7 +172,8 @@ export function createFirebaseAdapter({ client = getFirebaseClient(), expectedUi
           if (receipt.exists()) return confirmedEvent(receipt.data(), kind, input, uid);
           if (kind !== "receiveBatch") {
             const latest = (await getDocFromServer(doc(db, "batches", input.id))).data();
-            requireRevision(latest, input);
+            if (kind === "correctBatch") requireCorrectionRevision(latest, input);
+            else requireRevision(latest, input);
           }
         } catch (checkError) {
           if (["conflict", "already-saved"].includes(checkError.code)) throw checkError;
@@ -187,13 +226,13 @@ export function createFirebaseAdapter({ client = getFirebaseClient(), expectedUi
       return onSnapshot(query(collection(db, "activity"), where("batchId", "==", requireId(id))),
         { includeMetadataChanges: true }, (snapshot) => {
           if (snapshot.metadata.hasPendingWrites) return;
-          next(snapshot.docs.map((item) => item.data()).sort((a, b) =>
-            (dateOf(a.at)?.getTime() || 0) - (dateOf(b.at)?.getTime() || 0)), snapshot.metadata.fromCache);
+          next(snapshot.docs.map((item) => item.data()).sort((a, b) => a.version - b.version), snapshot.metadata.fromCache);
         }, () => fail(new Error("Batch history could not be loaded. Check your connection and account access.")));
     },
     receiveBatch: (input) => mutateBatch("receiveBatch", input),
     transitionBatch: (input) => mutateBatch("transitionBatch", input),
     archiveBatch: (input) => mutateBatch("archiveBatch", input),
+    correctBatch: (input) => mutateBatch("correctBatch", input),
     addStaff: (input) => mutateRoster("addStaff", input),
     setStaffActive: (input) => mutateRoster("setStaffActive", input),
     removeStaff: (input) => mutateRoster("removeStaff", input),

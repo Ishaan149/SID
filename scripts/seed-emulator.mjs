@@ -6,8 +6,7 @@ if (![firestorePort, authPort].every(port => Number.isInteger(port) && port > 0 
 const base = `http://127.0.0.1:${firestorePort}/v1/projects/${projectId}/databases/(default)/documents`;
 const authBase = `http://127.0.0.1:${authPort}/identitytoolkit.googleapis.com/v1/accounts:`;
 const password = 'demo-aete-only-2026';
-const accounts = [
-  ['manager', 'Demo Manager', 'Operations Manager', null],
+const roster = [
   ['plant', 'Demo Plant', 'Plant Supervisor', 'Plant'],
   ['shiftA', 'Demo Shift A', 'Shift A Supervisor', 'Shift A'],
   ['shiftB', 'Demo Shift B', 'Shift B Supervisor', 'Shift B'],
@@ -29,14 +28,13 @@ async function createIfMissing(collection,id,record) {
   const response = await fetch(url,{method:'PATCH',headers,body:JSON.stringify({fields:Object.fromEntries(Object.entries(record).map(([key,value])=>[key,typed(value)]))})});
   if (!response.ok) throw Error(`${response.status}: ${await response.text()}`);
 }
-for (const [role,name,staffRole,shift] of accounts) {
-  const email = `${role.toLowerCase()}@aete.test`;
-  let {response,result} = await authRequest('signUp',email);
-  if (!response.ok && result.error?.message === 'EMAIL_EXISTS') ({response,result}=await authRequest('signInWithPassword',email));
-  if (!response.ok) throw Error(`Emulator account setup failed: ${result.error?.message}`);
-  await createIfMissing('users',result.localId,{role,active:true});
+let {response,result} = await authRequest('signUp','manager@aete.test');
+if (!response.ok && result.error?.message === 'EMAIL_EXISTS') ({response,result}=await authRequest('signInWithPassword','manager@aete.test'));
+if (!response.ok) throw Error(`Emulator manager setup failed: ${result.error?.message}`);
+await createIfMissing('users',result.localId,{role:'manager',active:true});
+for (const [role,name,staffRole,shift] of roster) {
   await createIfMissing('roster',`demo-${role}`,{id:`demo-${role}`,name,role:staffRole,shift,active:true});
 }
-console.log('Prepared demo-aete emulator accounts and roster; no batches were created.');
-console.log('Emulator emails: manager@aete.test, plant@aete.test, shifta@aete.test, shiftb@aete.test');
+console.log('Prepared demo-aete manager account and sample roster; no batches were created.');
+console.log('Manager emulator email: manager@aete.test');
 console.log(`Emulator-only password: ${password}`);

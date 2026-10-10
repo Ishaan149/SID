@@ -4,10 +4,16 @@ service cloud.firestore {
     function accountPath() {
       return /databases/$(database)/documents/users/$(request.auth.uid);
     }
+    function anonymousAuth() {
+      return request.auth != null
+        && request.auth.token.get('firebase', {}).get('sign_in_provider', '') == 'anonymous';
+    }
     function member() {
       return request.auth != null && exists(accountPath())
         && get(accountPath()).data.active == true
-        && get(accountPath()).data.role in ['manager', 'plant', 'shiftA', 'shiftB'];
+        && get(accountPath()).data.role in ['manager', 'plant', 'shiftA', 'shiftB']
+        && (!anonymousAuth() || (get(accountPath()).data.role != 'manager'
+          && get(accountPath()).data.get('entry', '') == 'quick'));
     }
     function roleIs(role) {
       return member() && get(accountPath()).data.role == role;
@@ -43,6 +49,9 @@ service cloud.firestore {
     function archiveFields() {
       return ['archivedAt', 'archivedUid', 'archiveReason'];
     }
+    function correctionFields() {
+      return ['jobNo', 'customer', 'parts', 'piecesIn', 'weightIn', 'notes', 'piecesOut', 'weightOut'];
+    }
     function fieldsFor(status) {
       return status == 'Received' ? baseFields()
         : status == 'Processing' ? baseFields().concat(processFields())
@@ -53,7 +62,7 @@ service cloud.firestore {
       return validId(id) && b.keys().hasAll(baseFields()) && b.keys().hasOnly(baseFields())
         && b.id == id && text(b.jobNo, 80) && text(b.customer, 200) && text(b.parts, 500)
         && pieces(b.piecesIn) && weight(b.weightIn)
-        && text(b.receivedBy, 120) && validId(b.receivedStaffId) && b.receivedShift == 'Plant'
+        && text(b.receivedBy, 120)
         && b.notes is string && b.notes.size() <= 2000
         && b.archived == false && b.version is int && b.version == 1
         && validId(b.lastEventId) && b.updatedAt == request.time;
@@ -70,18 +79,28 @@ service cloud.firestore {
     function selectedStaff(id, name, shift) {
       let path = /databases/$(database)/documents/roster/$(id);
       return validId(id) && text(name, 120) && exists(path) && get(path).data.active == true
-        && get(path).data.name == name && get(path).data.shift == shift;
+        && get(path).data.name == name && get(path).data.shift == shift
+        && (get(accountPath()).data.get('entry', '') != 'quick'
+          || (get(accountPath()).data.staffId == id && get(accountPath()).data.name == name));
+    }
+    function managerAction(id, name, shift) {
+      return roleIs('manager') && id == null && name == 'Manager' && shift == null;
     }
     function eventMatches(e, b, eventId) {
       return e.keys().hasAll(['id', 'batchId', 'version', 'at', 'action', 'actorUid',
           'staffId', 'who', 'shift', 'jobNo', 'beforeStatus', 'afterStatus', 'snapshot'])
         && e.keys().hasOnly(['id', 'batchId', 'version', 'at', 'action', 'actorUid',
-          'staffId', 'who', 'shift', 'jobNo', 'beforeStatus', 'afterStatus', 'snapshot'])
+          'staffId', 'who', 'shift', 'jobNo', 'beforeStatus', 'afterStatus', 'snapshot']
+          .concat(e.action == 'Corrected' ? ['reason', 'beforeSnapshot'] : []))
         && e.id == eventId && b.lastEventId == eventId && validId(eventId)
         && e.batchId == b.id && e.version is int && e.version == b.version && e.at == request.time
         && e.actorUid == request.auth.uid && e.jobNo == b.jobNo
         && e.afterStatus == b.status && e.snapshot == b
-        && ((b.archived && e.action == 'Archived' && e.staffId == null
+        && ((e.action == 'Corrected' && roleIs('manager') && e.staffId == null
+              && e.who == 'Manager' && e.shift == null && text(e.reason, 500)
+              && exists(/databases/$(database)/documents/batches/$(b.id))
+              && e.beforeSnapshot == get(/databases/$(database)/documents/batches/$(b.id)).data)
+          || (b.archived && e.action == 'Archived' && e.staffId == null
               && e.who == 'Manager' && e.shift == null && b.archivedUid == e.actorUid)
           || (!b.archived && (
             (b.status == 'Received' && e.action == 'Received' && e.staffId == b.receivedStaffId
@@ -101,38 +120,65 @@ service cloud.firestore {
       return !exists(path) && getAfter(path).data.snapshot == b
         && getAfter(path).data.beforeStatus == beforeStatus;
     }
+    function pairedAction(b, action) {
+      return getAfter(/databases/$(database)/documents/activity/$(b.lastEventId)).data.action == action;
+    }
     function receive(b) {
-      return roleIs('plant') && b.status == 'Received' && !b.archived && b.version == 1
+      return member() && b.status == 'Received' && !b.archived && b.version == 1
         && b.receivedAt == request.time && b.receivedUid == request.auth.uid
-        && selectedStaff(b.receivedStaffId, b.receivedBy, 'Plant') && pairedEvent(b, null);
+        && ((roleIs('plant') && b.receivedShift == 'Plant'
+          && selectedStaff(b.receivedStaffId, b.receivedBy, 'Plant'))
+          || managerAction(b.receivedStaffId, b.receivedBy, b.receivedShift))
+        && pairedEvent(b, null) && pairedAction(b, 'Received');
     }
     function progress(a, b) {
       let changed = b.diff(a).affectedKeys();
       let audit = ['status', 'version', 'updatedAt', 'lastEventId'];
       let role = get(accountPath()).data.role;
-      let shift = role == 'shiftA' ? 'Shift A' : 'Shift B';
-      return !b.archived && (
-        (a.status == 'Received' && b.status == 'Processing' && role in ['shiftA', 'shiftB']
+      let shift = role == 'shiftA' ? 'Shift A' : role == 'shiftB' ? 'Shift B' : null;
+      return !b.archived && pairedAction(b, b.status == 'Processing' ? 'Into process'
+        : b.status == 'Ready' ? 'Ready' : 'Dispatched') && (
+        (a.status == 'Received' && b.status == 'Processing'
           && changed.hasOnly(audit.concat(processFields()))
           && b.processAt == request.time && b.processAt >= a.receivedAt && b.processUid == request.auth.uid
-          && b.processShift == shift && selectedStaff(b.processStaffId, b.processBy, shift))
-        || (a.status == 'Processing' && b.status == 'Ready' && role in ['shiftA', 'shiftB']
+          && ((role in ['shiftA', 'shiftB'] && b.processShift == shift
+            && selectedStaff(b.processStaffId, b.processBy, shift))
+            || managerAction(b.processStaffId, b.processBy, b.processShift)))
+        || (a.status == 'Processing' && b.status == 'Ready'
           && changed.hasOnly(audit.concat(readyFields()))
           && b.readyAt == request.time && b.readyAt >= a.processAt && b.readyUid == request.auth.uid
-          && b.readyShift == shift && pieces(b.piecesOut) && weight(b.weightOut)
-          && selectedStaff(b.readyStaffId, b.readyBy, shift))
-        || (a.status == 'Ready' && b.status == 'Dispatched' && role == 'plant'
+          && pieces(b.piecesOut) && weight(b.weightOut)
+          && ((role in ['shiftA', 'shiftB'] && b.readyShift == shift
+            && selectedStaff(b.readyStaffId, b.readyBy, shift))
+            || managerAction(b.readyStaffId, b.readyBy, b.readyShift)))
+        || (a.status == 'Ready' && b.status == 'Dispatched'
           && changed.hasOnly(audit.concat(dispatchFields()))
           && b.dispatchAt == request.time && b.dispatchAt >= a.readyAt && b.dispatchUid == request.auth.uid
-          && b.dispatchShift == 'Plant' && selectedStaff(b.dispatchStaffId, b.dispatchBy, 'Plant'))
+          && ((role == 'plant' && b.dispatchShift == 'Plant'
+            && selectedStaff(b.dispatchStaffId, b.dispatchBy, 'Plant'))
+            || managerAction(b.dispatchStaffId, b.dispatchBy, b.dispatchShift)))
       );
+    }
+    function correction(a, b) {
+      let changed = b.diff(a).affectedKeys();
+      let details = correctionFields();
+      let audit = ['version', 'updatedAt', 'lastEventId'];
+      return roleIs('manager') && b.status == a.status && b.archived == a.archived
+        && changed.hasOnly(details.concat(audit)) && changed.hasAny(details)
+        && text(b.jobNo, 80) && text(b.customer, 200) && text(b.parts, 500)
+        && pieces(b.piecesIn) && weight(b.weightIn)
+        && b.notes is string && b.notes.size() <= 2000
+        && pairedAction(b, 'Corrected')
+        && (a.status in ['Ready', 'Dispatched']
+          ? pieces(b.piecesOut) && weight(b.weightOut)
+          : !changed.hasAny(['piecesOut', 'weightOut']));
     }
     function archive(a, b) {
       return roleIs('manager') && b.archived && b.status == a.status
         && b.diff(a).affectedKeys().hasOnly(['archived', 'archivedAt', 'archivedUid',
           'archiveReason', 'version', 'updatedAt', 'lastEventId'])
         && b.archivedAt == request.time && b.archivedAt >= a.updatedAt && b.archivedUid == request.auth.uid
-        && text(b.archiveReason, 500);
+        && text(b.archiveReason, 500) && pairedAction(b, 'Archived');
     }
     function validRoster(s, id) {
       return validId(id) && s.keys().hasAll(['id', 'name', 'role', 'shift', 'active'])
@@ -144,18 +190,38 @@ service cloud.firestore {
           || (s.role == 'Operations Manager' && s.shift == null));
     }
 
-    // Login roles remain console-managed; managers cannot promote any account.
+    function selfQuickEntry(uid, profile) {
+      let staff = getAfter(/databases/$(database)/documents/roster/$(profile.staffId)).data;
+      return anonymousAuth() && request.auth.uid == uid
+        && profile.keys().hasAll(['role', 'active', 'entry', 'staffId', 'name'])
+        && profile.keys().hasOnly(['role', 'active', 'entry', 'staffId', 'name'])
+        && profile.active == true && profile.entry == 'quick'
+        && profile.role in ['plant', 'shiftA', 'shiftB'] && validId(profile.staffId)
+        && text(profile.name, 120) && validRoster(staff, profile.staffId)
+        && staff.active == true && staff.name == profile.name
+        && staff.shift == (profile.role == 'plant' ? 'Plant' : profile.role == 'shiftA' ? 'Shift A' : 'Shift B');
+    }
+    function ownQuickStaff(id) {
+      return anonymousAuth() && request.auth.uid == id
+        && !exists(accountPath())
+        && getAfter(accountPath()).data.staffId == id
+        && selfQuickEntry(id, getAfter(accountPath()).data);
+    }
+    // Anonymous quick entry can only create a staff profile. Manager grants remain console-only.
     match /users/{uid} {
       allow get: if request.auth != null && request.auth.uid == uid;
-      allow list, create, update, delete: if false;
+      allow create: if selfQuickEntry(uid, request.resource.data);
+      allow list, update, delete: if false;
     }
     match /batches/{id} {
       allow read: if member();
       allow create: if receive(request.resource.data) && validNewBatch(request.resource.data, id);
-      allow update: if member() && !resource.data.archived
+      allow update: if member()
         && validUpdate(request.resource.data, id)
         && request.resource.data.version == resource.data.version + 1
-        && (progress(resource.data, request.resource.data) || archive(resource.data, request.resource.data))
+        && (( !resource.data.archived && (progress(resource.data, request.resource.data)
+          || archive(resource.data, request.resource.data)))
+          || correction(resource.data, request.resource.data))
         && pairedEvent(request.resource.data, resource.data.status);
       allow delete: if false;
     }
@@ -174,8 +240,11 @@ service cloud.firestore {
       }
     }
     match /roster/{id} {
-      allow read: if member();
-      allow create, update: if roleIs('manager') && validRoster(request.resource.data, id);
+      // Anonymous quick entry reads names to reuse an existing roster entry.
+      allow read: if member() || anonymousAuth();
+      allow create: if validRoster(request.resource.data, id)
+        && (roleIs('manager') || ownQuickStaff(id));
+      allow update: if roleIs('manager') && validRoster(request.resource.data, id);
       allow delete: if roleIs('manager');
     }
     // Unknown collections, nested documents, and legacy PIN settings stay closed.

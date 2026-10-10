@@ -1,11 +1,11 @@
 import React, { useState, useEffect, useRef } from "react";
 import {
   Flame, Package, Play, CheckCircle2, Truck, AlertTriangle, Plus, X,
-  Trash2, Archive, Download, Users, LayoutDashboard, ClipboardList, ShieldCheck, LogIn,
+  Trash2, Archive, Download, Users, LayoutDashboard, ClipboardList, ShieldCheck, LogIn, Pencil,
 } from "lucide-react";
 import { createConfiguredDataService } from "./data/service.js";
 import AuthGate from "./auth/AuthGate.jsx";
-import { dateOf, newId, STAFF_SHIFTS } from "./data/mutations.js";
+import { correctionChanges, dateOf, newId, STAFF_SHIFTS } from "./data/mutations.js";
 import { inspectLegacyStorage, legacyBackup } from "./data/localStorageAdapter.js";
 import { serializeCSV } from "./data/csv.js";
 
@@ -23,6 +23,7 @@ const shiftLabel = (role) =>
 
 // who may perform the next action, given the batch's current stage
 function canActOn(role, status) {
+  if (role === "manager") return status !== "Dispatched";
   if (status === "Received" || status === "Processing")
     return role === "shiftA" || role === "shiftB"; // shift supervisors process
   if (status === "Ready") return role === "plant"; // plant supervisor dispatches
@@ -118,6 +119,7 @@ function Tracker({ session, onLogout, logoutError }) {
   const [refresh, setRefresh] = useState(0);
   const [showArchives, setShowArchives] = useState(false);
   const [archive, setArchive] = useState(null);
+  const [correction, setCorrection] = useState(null);
   const [history, setHistory] = useState(null);
   const alive = useRef(true);
   const saveInProgress = useRef(false);
@@ -172,7 +174,7 @@ function Tracker({ session, onLogout, logoutError }) {
   }
   function retrySave() {
     return saveChange("Previous request", () => dataService.retryPending(), () => {
-      setShowAdd(false); setAction(null); setArchive(null);
+      setShowAdd(false); setAction(null); setArchive(null); setCorrection(null);
     });
   }
   function addBatch(form, request) {
@@ -188,6 +190,12 @@ function Tracker({ session, onLogout, logoutError }) {
     return saveChange("Archive", () => dataService.archiveBatch({ id: batch.id,
       expectedVersion: batch.version, expectedStatus: batch.status, reason, mutationId,
     }), () => setArchive(null));
+  }
+  function correctBatch(batch, changes, reason, mutationId) {
+    return saveChange("Correction", () => dataService.correctBatch({ id: batch.id,
+      expectedVersion: batch.version, expectedStatus: batch.status, expectedArchived: batch.archived,
+      changes, reason, mutationId,
+    }), () => setCorrection(null));
   }
   function addStaff(name, role, id) {
     return saveChange("Staff member", () => dataService.addStaff({ id, name, role }));
@@ -267,8 +275,8 @@ function Tracker({ session, onLogout, logoutError }) {
             className="flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-md border border-stone-700 hover:bg-stone-800"
           >
             {isMgr ? <ShieldCheck size={15} className="text-amber-400" /> : <LogIn size={15} />}
-            {isMgr ? "Manager" : currentShift}
-            <span className="text-stone-500">· sign out</span>
+            {isMgr ? "Manager" : session.quickEntry ? session.name : currentShift}
+            <span className="text-stone-500">· {session.quickEntry ? "switch user" : "sign out"}</span>
           </button>
         </div>
         <nav className="max-w-2xl mx-auto px-2 flex">
@@ -290,7 +298,7 @@ function Tracker({ session, onLogout, logoutError }) {
       </header>
 
       <main className="max-w-2xl mx-auto px-4 py-4 pb-28">
-        <p className="mb-3 text-xs text-stone-500 break-all">Signed in as {session.email}</p>
+        <p className="mb-3 text-xs text-stone-500 break-all">Signed in as {session.quickEntry ? `${session.name} · ${currentShift}` : session.email}</p>
         <div role="status" className={`mb-3 rounded-md border px-3 py-2 text-xs ${connection.connected && session.permissionsVerified
           ? "border-emerald-200 bg-emerald-50 text-emerald-800" : "border-amber-200 bg-amber-50 text-amber-800"}`}>
           {connection.connected && session.permissionsVerified ? "Shared Firebase data connected." :
@@ -346,7 +354,7 @@ function Tracker({ session, onLogout, logoutError }) {
               <div className="space-y-2.5">
                 {sortedShown.map((b) => (
                   <BatchRow key={b.id} b={b} role={session.role} saving={writeBlocked} onAct={() => setAction({ batch: b })}
-                    canArchive={isMgr} onArchive={() => setArchive(b)} />
+                    canArchive={isMgr} onArchive={() => setArchive(b)} onCorrect={() => setCorrection(b)} />
                 ))}
               </div>
             )}
@@ -460,6 +468,7 @@ function Tracker({ session, onLogout, logoutError }) {
                         <td className="px-3 py-2 text-stone-600">{b.dispatchBy || "—"}</td>
                         <td className="px-3 py-2">
                           <button onClick={() => setHistory(b)} className="mr-3 text-xs underline">History</button>
+                          <button disabled={writeBlocked} onClick={() => setCorrection(b)} className="mr-3 text-xs underline disabled:opacity-50">Correct</button>
                           {!b.archived && <button disabled={writeBlocked} onClick={() => setArchive(b)} aria-label={`Archive ${b.jobNo}`}
                             className="text-stone-400 hover:text-amber-600 disabled:opacity-50"><Archive size={15} /></button>}
                           {b.archived && <p className="text-xs text-stone-500 max-w-48 whitespace-normal">{b.archiveReason}<br />{fmt(b.archivedAt)}</p>}
@@ -481,7 +490,7 @@ function Tracker({ session, onLogout, logoutError }) {
       </main>
 
       {/* floating "log batch" button on batches tab */}
-      {tab === "batches" && session.role === "plant" && (
+      {tab === "batches" && (session.role === "plant" || isMgr) && (
         <button
           onClick={() => setShowAdd(true)}
           disabled={writeBlocked}
@@ -492,15 +501,20 @@ function Tracker({ session, onLogout, logoutError }) {
       )}
 
       {action && (
-        <ActionModal batch={action.batch} staff={activeStaff} shift={currentShift} saving={saving} disabled={writeBlocked} stale={!batches.some((b) => b.id === action.batch.id && b.version === action.batch.version)} error={saveError} pending={!!connection.pendingRequest && !saving} onRetry={retrySave} canRetry={connection.connected && session.permissionsVerified && !saving}
+        <ActionModal batch={action.batch} staff={activeStaff} shift={currentShift} manager={isMgr} fixedStaff={session.quickEntry ? { id: session.staffId, name: session.name } : null} saving={saving} disabled={writeBlocked} stale={!batches.some((b) => b.id === action.batch.id && b.version === action.batch.version)} error={saveError} pending={!!connection.pendingRequest && !saving} onRetry={retrySave} canRetry={connection.connected && session.permissionsVerified && !saving}
           onClose={() => { if (!saving) setAction(null); }} onConfirm={applyAction} />
       )}
       {archive && <ArchiveModal batch={archive} saving={saving} disabled={writeBlocked}
         stale={!batches.some((b) => b.id === archive.id && b.version === archive.version)} error={saveError} pending={!!connection.pendingRequest && !saving} onRetry={retrySave} canRetry={connection.connected && session.permissionsVerified && !saving}
         onClose={() => { if (!saving) setArchive(null); }} onConfirm={archiveBatch} />}
       {history && <HistoryModal batch={history} service={dataService} onClose={() => setHistory(null)} />}
+      {correction && <CorrectionModal batch={correction} saving={saving} disabled={writeBlocked}
+        stale={!allBatches.some((b) => b.id === correction.id && b.version === correction.version)}
+        error={saveError} pending={!!connection.pendingRequest && !saving} onRetry={retrySave}
+        canRetry={connection.connected && session.permissionsVerified && !saving}
+        onClose={() => { if (!saving) setCorrection(null); }} onConfirm={correctBatch} />}
       {showAdd && (
-        <AddModal staff={activeStaff} shift={currentShift} saving={saving} disabled={writeBlocked} error={saveError} pending={!!connection.pendingRequest && !saving} onRetry={retrySave} canRetry={connection.connected && session.permissionsVerified && !saving}
+        <AddModal staff={activeStaff} shift={currentShift} manager={isMgr} fixedStaff={session.quickEntry ? { id: session.staffId, name: session.name } : null} saving={saving} disabled={writeBlocked} error={saveError} pending={!!connection.pendingRequest && !saving} onRetry={retrySave} canRetry={connection.connected && session.permissionsVerified && !saving}
           onClose={() => { if (!saving) setShowAdd(false); }} onAdd={addBatch} />
       )}
     </div>
@@ -517,7 +531,7 @@ function Empty({ text }) {
   );
 }
 
-function BatchRow({ b, role, saving, onAct, canArchive, onArchive }) {
+function BatchRow({ b, role, saving, onAct, canArchive, onArchive, onCorrect }) {
   const fl = flagsFor(b);
   const step = NEXT[b.status];
   const allowed = step && canActOn(role, b.status);
@@ -561,9 +575,10 @@ function BatchRow({ b, role, saving, onAct, canArchive, onArchive }) {
             <span className="text-xs text-stone-400">{waitingHint}</span>
           )}
           {canArchive && (
-            <button disabled={saving} onClick={onArchive} aria-label={`Archive ${b.jobNo}`} className="ml-auto text-stone-300 hover:text-amber-600 disabled:opacity-50">
-              <Archive size={16} />
-            </button>
+            <div className="ml-auto flex gap-2">
+              <button disabled={saving} onClick={onCorrect} aria-label={`Correct ${b.jobNo}`} className="text-stone-400 hover:text-amber-600 disabled:opacity-50"><Pencil size={16} /></button>
+              <button disabled={saving} onClick={onArchive} aria-label={`Archive ${b.jobNo}`} className="text-stone-300 hover:text-amber-600 disabled:opacity-50"><Archive size={16} /></button>
+            </div>
           )}
         </div>
       </div>
@@ -600,14 +615,14 @@ function WhoSelect({ staff, value, onChange, shift }) {
   );
 }
 
-function ActionModal({ batch, staff, shift, saving, disabled, stale, error, pending, onRetry, canRetry, onClose, onConfirm }) {
+function ActionModal({ batch, staff, shift, manager, fixedStaff, saving, disabled, stale, error, pending, onRetry, canRetry, onClose, onConfirm }) {
   const step = NEXT[batch.status];
   const [mutationId] = useState(newId);
-  const [who, setWho] = useState("");
+  const [who, setWho] = useState(manager ? null : fixedStaff?.id || "");
   const [piecesOut, setPiecesOut] = useState(batch.piecesIn ?? "");
   const [weightOut, setWeightOut] = useState("");
   const needQty = batch.status === "Processing";
-  const ok = staff.some((s) => s.id === who && s.shift === shift) && (!needQty || (
+  const ok = (manager || staff.some((s) => s.id === who && s.shift === shift)) && (!needQty || (
     piecesOut !== "" && Number.isInteger(Number(piecesOut)) && Number(piecesOut) >= 0 && Number(piecesOut) <= 1e9 &&
     weightOut !== "" && Number.isFinite(Number(weightOut)) && Number(weightOut) >= 0 && Number(weightOut) <= 1e12
   ));
@@ -639,7 +654,7 @@ function ActionModal({ batch, staff, shift, saving, disabled, stale, error, pend
         )}
         <div>
           <label className={lbl}>Who is doing this?</label>
-          <WhoSelect staff={staff} value={who} onChange={setWho} shift={shift} />
+          {manager ? <p className="text-sm">Manager account</p> : fixedStaff ? <p className="text-sm">{fixedStaff.name}</p> : <WhoSelect staff={staff} value={who} onChange={setWho} shift={shift} />}
         </div>
       </div>
       {error && <p role="alert" className="mt-4 text-sm text-red-700">{error}</p>}
@@ -654,11 +669,11 @@ function ActionModal({ batch, staff, shift, saving, disabled, stale, error, pend
   );
 }
 
-function AddModal({ staff, shift, saving, disabled, error, pending, onRetry, canRetry, onClose, onAdd }) {
+function AddModal({ staff, shift, manager, fixedStaff, saving, disabled, error, pending, onRetry, canRetry, onClose, onAdd }) {
   const [request] = useState(() => ({ id: newId(), mutationId: newId() }));
-  const [f, setF] = useState({ jobNo: "", customer: "", parts: "", piecesIn: "", weightIn: "", staffId: "" });
+  const [f, setF] = useState({ jobNo: "", customer: "", parts: "", piecesIn: "", weightIn: "", staffId: manager ? null : fixedStaff?.id || "" });
   const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
-  const ok = f.jobNo.trim() && f.customer.trim() && f.parts.trim() && staff.some((s) => s.id === f.staffId && s.shift === shift) &&
+  const ok = f.jobNo.trim() && f.customer.trim() && f.parts.trim() && (manager || staff.some((s) => s.id === f.staffId && s.shift === shift)) &&
     f.piecesIn !== "" && Number.isInteger(Number(f.piecesIn)) && Number(f.piecesIn) >= 0 && Number(f.piecesIn) <= 1e9 &&
     f.weightIn !== "" && Number.isFinite(Number(f.weightIn)) && Number(f.weightIn) >= 0 && Number(f.weightIn) <= 1e12;
   return (
@@ -679,7 +694,7 @@ function AddModal({ staff, shift, saving, disabled, error, pending, onRetry, can
             <input type="number" min="0" max="1000000000000" step="any" className={field} value={f.weightIn} onChange={set("weightIn")} /></div>
         </div>
         <div><label className={lbl}>Received by</label>
-          <WhoSelect staff={staff} value={f.staffId} onChange={(v) => setF({ ...f, staffId: v })} shift={shift} /></div>
+          {manager ? <p className="text-sm">Manager account</p> : fixedStaff ? <p className="text-sm">{fixedStaff.name}</p> : <WhoSelect staff={staff} value={f.staffId} onChange={(v) => setF({ ...f, staffId: v })} shift={shift} />}</div>
       </div>
       {error && <p role="alert" className="mt-4 text-sm text-red-700">{error}</p>}
       <PendingRetry pending={pending} onRetry={onRetry} canRetry={canRetry} />
@@ -751,7 +766,7 @@ function ArchiveModal({ batch, saving, disabled, stale, error, pending, onRetry,
   const [reason, setReason] = useState("");
   const [mutationId] = useState(newId);
   return <Sheet title={`Archive ${batch.jobNo}`} onClose={onClose}>
-    <p className="text-sm text-stone-600 mb-4">This removes the batch from the active tracker and retains its details and activity history. Archived batches cannot be edited or restored.</p>
+    <p className="text-sm text-stone-600 mb-4">This removes the batch from the active tracker and retains its details and activity history. Managers can still correct its business details later.</p>
     <label className={lbl} htmlFor="archive-reason">Reason</label>
     <textarea id="archive-reason" maxLength={500} className={field} value={reason} onChange={(e) => setReason(e.target.value)} />
     {error && <p role="alert" className="mt-3 text-sm text-red-700">{error}</p>}
@@ -759,6 +774,52 @@ function ArchiveModal({ batch, saving, disabled, stale, error, pending, onRetry,
     <PendingRetry pending={pending} onRetry={onRetry} canRetry={canRetry} />
     <button disabled={disabled || saving || stale || !reason.trim()} onClick={() => onConfirm(batch, reason, mutationId)}
       className="w-full mt-4 rounded-md bg-stone-900 text-white py-2.5 disabled:opacity-50">{saving ? "Saving…" : "Archive batch"}</button>
+  </Sheet>;
+}
+const detailLabels = {
+  jobNo: "Job card no", customer: "Customer", parts: "Parts description",
+  piecesIn: "Pieces in", weightIn: "Weight in (kg)", notes: "Notes",
+  piecesOut: "Pieces out", weightOut: "Weight out (kg)",
+};
+function CorrectionModal({ batch, saving, disabled, stale, error, pending, onRetry, canRetry, onClose, onConfirm }) {
+  const [mutationId] = useState(newId);
+  const fields = Object.keys(detailLabels).filter((key) =>
+    (key !== "piecesOut" && key !== "weightOut") || ["Ready", "Dispatched"].includes(batch.status));
+  const [values, setValues] = useState(() => Object.fromEntries(fields.map((key) => [key, String(batch[key] ?? "")])));
+  const [reason, setReason] = useState("");
+  const changes = Object.fromEntries(fields.filter((key) => {
+    const value = key.startsWith("pieces") || key.startsWith("weight") ? Number(values[key]) : values[key].trim();
+    return value !== batch[key];
+  }).map((key) => [key, values[key]]));
+  const valid = reason.trim() && Object.keys(changes).length && fields.every((key) => {
+    const value = values[key];
+    if (key === "notes") return value.length <= 2000;
+    if (key.startsWith("pieces")) return value !== "" && Number.isInteger(Number(value)) && Number(value) >= 0 && Number(value) <= 1e9;
+    if (key.startsWith("weight")) return value !== "" && Number.isFinite(Number(value)) && Number(value) >= 0 && Number(value) <= 1e12;
+    return value.trim() && value.length <= (key === "jobNo" ? 80 : key === "customer" ? 200 : 500);
+  });
+  return <Sheet title={`Correct ${batch.jobNo}`} onClose={onClose}>
+    <p className="mb-3 text-sm text-stone-600">Correct business details for this {batch.archived ? "archived" : batch.status.toLowerCase()} batch. Its stage and earlier history stay recorded.</p>
+    <div className="space-y-3">
+      {fields.map((key) => <div key={key}>
+        <label className={lbl} htmlFor={`correction-${key}`}>{detailLabels[key]}</label>
+        {key === "notes" ? <textarea id={`correction-${key}`} maxLength={2000} className={field} value={values[key]}
+          onChange={(e) => setValues({ ...values, [key]: e.target.value })} />
+          : <input id={`correction-${key}`} className={field} value={values[key]}
+            maxLength={key === "jobNo" ? 80 : key === "customer" ? 200 : key === "parts" ? 500 : undefined}
+            type={key.startsWith("pieces") || key.startsWith("weight") ? "number" : "text"}
+            min={key.startsWith("pieces") || key.startsWith("weight") ? 0 : undefined}
+            step={key.startsWith("pieces") ? 1 : key.startsWith("weight") ? "any" : undefined}
+            onChange={(e) => setValues({ ...values, [key]: e.target.value })} />}
+      </div>)}
+      <div><label className={lbl} htmlFor="correction-reason">Reason for correction</label>
+        <textarea id="correction-reason" maxLength={500} className={field} value={reason} onChange={(e) => setReason(e.target.value)} /></div>
+    </div>
+    {error && <p role="alert" className="mt-3 text-sm text-red-700">{error}</p>}
+    {stale && <p role="alert" className="mt-3 text-sm text-amber-800">This batch changed. Close this form and review its current details.</p>}
+    <PendingRetry pending={pending} onRetry={onRetry} canRetry={canRetry} />
+    <button disabled={!valid || disabled || stale || saving} onClick={() => onConfirm(batch, changes, reason, mutationId)}
+      className="w-full mt-4 rounded-md bg-stone-900 text-white py-2.5 disabled:opacity-50">{saving ? "Saving…" : "Save correction"}</button>
   </Sheet>;
 }
 function HistoryModal({ batch, service, onClose }) {
@@ -779,9 +840,16 @@ function HistoryModal({ batch, service, onClose }) {
         <p className="font-semibold">{entry.action} · {fmt(entry.at)}</p>
         <p>{entry.who}{entry.shift ? ` · ${entry.shift}` : ""}</p>
         <p className="mt-1 text-xs text-stone-500 break-all">Submitted by account: {entry.actorUid}</p>
+        {entry.action === "Corrected" && <>
+          <p className="mt-1 text-xs">Reason: {entry.reason}</p>
+          <ul className="mt-1 text-xs text-stone-600 space-y-1">
+            {correctionChanges(entry.beforeSnapshot, entry.snapshot).map((key) =>
+              <li key={key}>{detailLabels[key]}: {String(entry.beforeSnapshot[key] ?? "")} → {String(entry.snapshot[key] ?? "")}</li>)}
+          </ul>
+        </>}
         <p className="mt-1 text-xs text-stone-600">{entry.snapshot.piecesIn} pcs · {entry.snapshot.weightIn} kg in
           {entry.snapshot.piecesOut != null && ` → ${entry.snapshot.piecesOut} pcs · ${entry.snapshot.weightOut} kg out`}</p>
-        {entry.snapshot.archiveReason && <p className="mt-1 text-xs">Reason: {entry.snapshot.archiveReason}</p>}
+        {entry.action === "Archived" && entry.snapshot.archiveReason && <p className="mt-1 text-xs">Reason: {entry.snapshot.archiveReason}</p>}
       </li>)}
     </ol>
   </Sheet>;

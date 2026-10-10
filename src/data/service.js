@@ -47,6 +47,7 @@ export function createDataService({ adapter, journal, getSession = () => ({ perm
     receiveBatch: (input) => mutate("receiveBatch", input),
     transitionBatch: (input) => mutate("transitionBatch", input),
     archiveBatch: (input) => mutate("archiveBatch", input),
+    correctBatch: (input) => mutate("correctBatch", input),
     addStaff: (input) => mutate("addStaff", input),
     setStaffActive: (input) => mutate("setStaffActive", input),
     removeStaff: (input) => mutate("removeStaff", input),

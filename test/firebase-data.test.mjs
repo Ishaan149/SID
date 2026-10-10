@@ -46,6 +46,36 @@ test('Phase 4 shared adapter with real authenticated clients and deployed emulat
       assert.deepEqual(Object.keys(saved).sort(),['active','id','name','role','shift']); assert.equal(saved.shift,'Plant');
       await assert.rejects(plant.adapter.addStaff({id:`${prefix}_denied`,name:'No',role:'Plant Supervisor'}),{code:'access-denied'});
     });
+    await t.test('manager receives, advances, corrects, archives, and corrects an archived batch with account attribution',async()=>{
+      const id=`${prefix}_manager_batch`;
+      const receive={id,mutationId:`${prefix}_manager_receive`,jobNo:'M-1',customer:'Original',parts:'Frames',piecesIn:10,weightIn:100,staffId:null};
+      await manager.service.receiveBatch(receive);
+      for (const [status,version,suffix,extra] of [
+        ['Received',1,'process',{}],['Processing',2,'ready',{piecesOut:9,weightOut:99}],['Ready',3,'dispatch',{}],
+      ]) await manager.service.transitionBatch({id,mutationId:`${prefix}_manager_${suffix}`,expectedStatus:status,expectedVersion:version,staffId:null,...extra});
+      let b=(await getDocFromServer(doc(manager.db,'batches',id))).data();
+      assert.equal(b.status,'Dispatched');
+      for(const key of ['receivedUid','processUid','readyUid','dispatchUid']) assert.equal(b[key],manager.uid);
+      const correction={id,mutationId:`${prefix}_manager_correction`,expectedStatus:b.status,expectedVersion:b.version,expectedArchived:false,
+        changes:{customer:'Corrected customer',piecesOut:10},reason:'Verified against job card'};
+      await manager.service.correctBatch(correction);
+      assert.equal((await manager.adapter.correctBatch(correction)).replayed,true);
+      b=(await getDocFromServer(doc(manager.db,'batches',id))).data();
+      assert.equal(b.customer,'Corrected customer'); assert.equal(b.piecesOut,10);
+      let event=(await getDocFromServer(doc(manager.db,'activity',b.lastEventId))).data();
+      assert.equal(event.actorUid,manager.uid); assert.equal(event.reason,correction.reason);
+      assert.equal(event.beforeSnapshot.customer,'Original'); assert.equal(event.snapshot.customer,'Corrected customer');
+      await assert.rejects(plant.adapter.correctBatch({...correction,mutationId:`${prefix}_denied`,expectedVersion:b.version,changes:{notes:'forged'}}),{code:'access-denied'});
+      await manager.service.archiveBatch({id,mutationId:`${prefix}_manager_archive`,expectedStatus:'Dispatched',expectedVersion:b.version,reason:'Complete'});
+      b=(await getDocFromServer(doc(manager.db,'batches',id))).data();
+      await manager.service.correctBatch({id,mutationId:`${prefix}_manager_archived_correction`,expectedStatus:b.status,
+        expectedVersion:b.version,expectedArchived:true,changes:{notes:'Archive verified'},reason:'Final paperwork'});
+      b=(await getDocFromServer(doc(manager.db,'batches',id))).data();
+      assert.equal(b.archived,true); assert.equal(b.notes,'Archive verified');
+      const events=await getDocsFromServer(query(collection(manager.db,'activity'),where('batchId','==',id)));
+      assert.equal(events.size,7);
+      assert.equal(events.docs.filter(d=>d.data().action==='Corrected').length,2);
+    });
     const receive={id:`${prefix}_batch`,mutationId:`${prefix}_receive`,jobNo:'JC-PHASE4',customer:'Shared test',parts:'Cable tray',piecesIn:'10',weightIn:'125.5',staffId:staff.plant};
     await t.test('received batch and immutable receipt commit together, live read reflects server timestamps, and duplicate retry has one event',async()=>{
       await plant.service.receiveBatch(receive);

@@ -44,14 +44,24 @@ export function requireRevision(batch, input) {
     throw trackerError("conflict", "This batch changed or was archived by someone else. Close this form and review the latest batch before acting.");
   }
 }
-export function activityFor(batch, beforeStatus, uid) {
+export const CORRECTABLE_FIELDS = Object.freeze(["jobNo", "customer", "parts", "piecesIn", "weightIn", "notes", "piecesOut", "weightOut"]);
+export function requireCorrectionRevision(batch, input) {
+  if (!batch || batch.version !== input.expectedVersion || batch.status !== input.expectedStatus || batch.archived !== input.expectedArchived) {
+    throw trackerError("conflict", "This batch changed. Close this form and review the latest record before correcting it.");
+  }
+}
+export function correctionChanges(before, after) {
+  return CORRECTABLE_FIELDS.filter((key) => before[key] !== after[key]);
+}
+export function activityFor(batch, beforeStatus, uid, correction = null) {
   const prefix = { Received: "received", Processing: "process", Ready: "ready", Dispatched: "dispatch" }[batch.status];
   return {
     id: batch.lastEventId, batchId: batch.id, version: batch.version, at: batch.updatedAt,
-    action: batch.archived ? "Archived" : { Received: "Received", Processing: "Into process", Ready: "Ready", Dispatched: "Dispatched" }[batch.status],
-    actorUid: uid, staffId: batch.archived ? null : batch[`${prefix}StaffId`],
-    who: batch.archived ? "Manager" : batch[`${prefix}By`], shift: batch.archived ? null : batch[`${prefix}Shift`],
+    action: correction ? "Corrected" : batch.archived ? "Archived" : { Received: "Received", Processing: "Into process", Ready: "Ready", Dispatched: "Dispatched" }[batch.status],
+    actorUid: uid, staffId: correction || batch.archived ? null : batch[`${prefix}StaffId`],
+    who: correction || batch.archived ? "Manager" : batch[`${prefix}By`], shift: correction || batch.archived ? null : batch[`${prefix}Shift`],
     jobNo: batch.jobNo, beforeStatus, afterStatus: batch.status, snapshot: batch,
+    ...(correction ? { reason: correction.reason, beforeSnapshot: correction.before } : {}),
   };
 }
 export function dateOf(value) {

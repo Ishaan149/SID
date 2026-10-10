@@ -31,6 +31,12 @@ test("only active, recognized server profiles grant a role; roster/PIN fields ca
     { role: "Operations Manager", active: true }]) {
     assert.equal(accountSession(user, profile), null);
   }
+  const anonymous = { uid: "anonymous", isAnonymous: true };
+  const quick = { role: "shiftA", active: true, entry: "quick", staffId: "staff-a", name: "A Worker" };
+  assert.equal(accountSession(anonymous, quick).name, "A Worker");
+  assert.equal(accountSession(anonymous, { ...quick, role: "manager" }), null);
+  assert.equal(accountSession(anonymous, { role: "plant", active: true }), null);
+  assert.equal(accountSession(user, quick), null);
 });
 
 test("logout and account switches invalidate queued callbacks from the previous account", () => {
@@ -61,8 +67,10 @@ test("cached roles cannot unlock access; revocation and listener failure close t
   assert.equal(h.states.at(-1).status, "ready");
   profile.next({ role: "manager", active: false }, false);
   assert.equal(h.states.at(-1).status, "unassigned");
+  assert.equal(h.states.at(-1).profileMissing, false);
   profile.next(null, false);
   assert.equal(h.states.at(-1).status, "unassigned");
+  assert.equal(h.states.at(-1).profileMissing, true);
   profile.next({ role: "shiftA", active: true }, false);
   assert.equal(h.states.at(-1).session.role, "shiftA");
   profile.error(new Error("permission denied"));

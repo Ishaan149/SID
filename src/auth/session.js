@@ -2,7 +2,14 @@ export const ACCOUNT_ROLES = Object.freeze(["manager", "plant", "shiftA", "shift
 
 export function accountSession(user, profile) {
   if (!user || profile?.active !== true || !ACCOUNT_ROLES.includes(profile.role)) return null;
-  return { uid: user.uid, email: user.email || "", role: profile.role };
+  if (user.isAnonymous) {
+    if (profile.entry !== "quick" || profile.role === "manager" ||
+        typeof profile.name !== "string" || !profile.name.trim() ||
+        typeof profile.staffId !== "string" || !profile.staffId) return null;
+    return { uid: user.uid, email: "", role: profile.role, name: profile.name, staffId: profile.staffId, quickEntry: true };
+  }
+  if (profile.entry === "quick") return null;
+  return { uid: user.uid, email: user.email || "", role: profile.role, quickEntry: false };
 }
 
 // Inject listeners so logout, revocation, and account-switch races can be tested.
@@ -32,7 +39,7 @@ export function observeSession({ observeAuth, observeProfile }, notify) {
       }
       verified = accountSession(user, profile);
       notify(verified ? { status: "ready", session: { ...verified, permissionsVerified: true } }
-        : { status: "unassigned", user });
+        : { status: "unassigned", user, profileMissing: profile == null });
     }, () => {
       verified = null;
       if (alive && current === generation) notify({ status: "error", user });

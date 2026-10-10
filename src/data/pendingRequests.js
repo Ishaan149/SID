@@ -1,6 +1,6 @@
 import { trackerError } from "./mutations.js";
 
-const operations = new Set(["receiveBatch", "transitionBatch", "archiveBatch", "addStaff", "setStaffActive", "removeStaff"]);
+const operations = new Set(["receiveBatch", "transitionBatch", "archiveBatch", "correctBatch", "addStaff", "setStaffActive", "removeStaff"]);
 export function createPendingJournal(storage, projectId, uid) {
   const key = `aete_pending_v1:${projectId}:${uid}`;
   let memory = null;

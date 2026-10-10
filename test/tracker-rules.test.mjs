@@ -6,6 +6,7 @@ import {
   setDoc, updateDoc, deleteDoc, writeBatch, serverTimestamp, runTransaction,
   terminate, Timestamp, setLogLevel,
 } from "firebase/firestore";
+import { quickEntryRecords } from "../src/auth/quickEntry.js";
 
 const host = process.env.FIRESTORE_EMULATOR_HOST;
 const projectId = "demo-aete";
@@ -70,6 +71,10 @@ function archived(old, uid, patch = {}) {
     updatedAt: serverTimestamp(), lastEventId: unique("event"), ...patch,
   };
 }
+function corrected(old, patch = {}) {
+  return { ...old, ...patch, version: old.version + 1,
+    updatedAt: serverTimestamp(), lastEventId: unique("event") };
+}
 
 async function atomic(db, b, beforeStatus = null, eventPatch = {}) {
   const writes = writeBatch(db);
@@ -85,11 +90,13 @@ test("tracker server rules", { skip: !host, timeout: 90000 }, async (t) => {
   setLogLevel("silent");
   const [hostname, port] = host.split(":");
   const clients = [];
-  const client = (name, role, active = true) => {
+  const client = (name, role, active = true, anonymousToken = false) => {
     const app = initializeApp({ projectId, apiKey: "demo-key" }, `r3-${name}`);
     const db = getFirestore(app);
     const uid = name === "anonymous" ? null : `r3-${name}`;
-    connectFirestoreEmulator(db, hostname, Number(port), uid ? { mockUserToken: { sub: uid } } : {});
+    connectFirestoreEmulator(db, hostname, Number(port), uid ? { mockUserToken: {
+      sub: uid, ...(anonymousToken ? { firebase: { sign_in_provider: "anonymous" } } : {}),
+    } } : {});
     db.actorUid = uid;
     clients.push({ db, app, uid, role, active });
     return db;
@@ -158,6 +165,21 @@ test("tracker server rules", { skip: !host, timeout: 90000 }, async (t) => {
       assert.equal(e.staffId, staff.plant.id);
     });
 
+    await t.test("quick-entry actions can only use the name bound to their anonymous identity", async () => {
+      const quick = client("quickPlant", null, true, true);
+      const records = quickEntryRecords(quick.actorUid, "Quick Plant Person", "plant");
+      const setup = writeBatch(quick);
+      setup.set(doc(quick, "users", quick.actorUid), records.profile);
+      setup.set(doc(quick, "roster", quick.actorUid), records.staff);
+      await setup.commit();
+      await reject(atomic(quick, received(quick.actorUid)));
+      const own = received(quick.actorUid, { receivedStaffId: quick.actorUid, receivedBy: records.staff.name });
+      await atomic(quick, own);
+      const event = (await getDocFromServer(doc(quick, "activity", own.lastEventId))).data();
+      assert.equal(event.who, records.staff.name);
+      assert.equal(event.actorUid, quick.actorUid);
+    });
+
     await t.test("Shift B can start processing, Shift A can complete it, and a second Shift A account can act", async () => {
       const b = await atStage();
       await atomic(shiftB, advanced(b, shiftB.actorUid, "shiftB"), b.status);
@@ -167,6 +189,66 @@ test("tracker server rules", { skip: !host, timeout: 90000 }, async (t) => {
       const another = await atStage();
       await atomic(otherA, advanced(another, otherA.actorUid, "shiftA"), another.status);
       assert.equal((await read(manager, another.id)).processUid, otherA.actorUid);
+    });
+
+    await t.test("manager can receive and advance every stage under the manager account", async () => {
+      let b = received(manager.actorUid, { receivedStaffId: null, receivedBy: "Manager", receivedShift: null });
+      await atomic(manager, b);
+      b = await read(manager, b.id);
+      assert.equal(b.receivedUid, manager.actorUid);
+      for (const [prefix, status] of [["process", "Processing"], ["ready", "Ready"], ["dispatch", "Dispatched"]]) {
+        const next = { ...b, status, version: b.version + 1, updatedAt: serverTimestamp(), lastEventId: unique("event"),
+          [`${prefix}By`]: "Manager", [`${prefix}StaffId`]: null, [`${prefix}Shift`]: null,
+          [`${prefix}At`]: serverTimestamp(), [`${prefix}Uid`]: manager.actorUid,
+          ...(status === "Ready" ? { piecesOut: 9, weightOut: 98 } : {}) };
+        await atomic(manager, next, b.status);
+        b = await read(manager, b.id);
+        assert.equal(b[`${prefix}Uid`], manager.actorUid);
+        const event = (await getDocFromServer(doc(manager, "activity", b.lastEventId))).data();
+        assert.equal(event.actorUid, manager.actorUid);
+        assert.equal(event.who, "Manager");
+      }
+    });
+
+    await t.test("manager corrections work at every stage including archived, with immutable before and after history", async () => {
+      for (const status of ["Received", "Processing", "Ready", "Dispatched"]) {
+        const b = await atStage(status);
+        const next = corrected(b, { customer: `Corrected ${status}`, piecesIn: 11,
+          ...(status === "Ready" || status === "Dispatched" ? { piecesOut: 9 } : {}) });
+        const event = { action: "Corrected", who: "Manager", staffId: null, shift: null,
+          reason: "Corrected job card", beforeSnapshot: b };
+        for (const db of [plant, shiftA, shiftB]) await reject(atomic(db, next, b.status, event));
+        await reject(atomic(manager, next, b.status, { ...event, reason: " " }));
+        await reject(atomic(manager, next, b.status, { ...event, beforeSnapshot: { ...b, customer: "Forged" } }));
+        await reject(atomic(manager, corrected(b, { receivedBy: "Rewritten" }), b.status,
+          { ...event, beforeSnapshot: b }));
+        await reject(atomic(manager, corrected(b), b.status, event));
+        if (status === "Received") await reject(atomic(manager, next, b.status,
+          { action: "Received", who: b.receivedBy, staffId: b.receivedStaffId, shift: b.receivedShift }));
+        await atomic(manager, next, b.status, event);
+        const current = await read(manager, b.id);
+        const log = (await getDocFromServer(doc(manager, "activity", current.lastEventId))).data();
+        assert.equal(log.actorUid, manager.actorUid);
+        assert.equal(log.beforeSnapshot.customer, b.customer);
+        assert.equal(log.snapshot.customer, `Corrected ${status}`);
+        await reject(updateDoc(doc(manager, "activity", log.id), { reason: "rewritten" }));
+        if (status === "Dispatched") {
+          await atomic(manager, archived(current, manager.actorUid), current.status);
+          const old = await read(manager, b.id);
+          const archivedNext = corrected(old, { notes: "Fixed archive record" });
+          await reject(atomic(manager, corrected(old, { archiveReason: "Rewritten" }), old.status,
+            { action: "Corrected", who: "Manager", staffId: null, shift: null,
+              reason: "Forbidden metadata change", beforeSnapshot: old }));
+          await reject(atomic(manager, archivedNext, old.status,
+            { action: "Archived", who: "Manager", staffId: null, shift: null }));
+          await atomic(manager, archivedNext, old.status, { action: "Corrected", who: "Manager", staffId: null,
+            shift: null, reason: "Archive detail correction", beforeSnapshot: old });
+          const final = await read(manager, b.id);
+          assert.equal(final.archived, true);
+          assert.equal(final.archiveReason, old.archiveReason);
+          assert.equal(final.notes, "Fixed archive record");
+        }
+      }
     });
 
     await t.test("direct SDK requests cannot bypass role checks at any stage", async () => {
